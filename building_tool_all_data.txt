@@ -1,0 +1,5886 @@
+import bpy
+from .core import register_core, unregister_core
+
+bl_info = {
+    "name": "Building Tools",
+    "author": "Ian Ichung'wa Karanja (ranjian0), Lucky Kadam (luckykadam)",
+    "version": (1, 0, 0),
+    "blender": (2, 80, 0),
+    "location": "View3D > Toolshelf > Building Tools",
+    "description": "Building Creation Tools",
+    "warning": "",
+    "wiki_url": "",
+    "tracker_url": "",
+    "category": "Mesh",
+}
+
+
+class BTOOLS_PT_mesh_tools(bpy.types.Panel):
+
+    bl_label = "Mesh Tools"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Building Tools"
+
+    def draw(self, context):
+        layout = self.layout
+
+        # Draw Operators
+        # ``````````````
+        col = layout.column(align=True)
+        col.operator("btools.add_floorplan")
+        row = col.row(align=True)
+        row.operator("btools.add_floors")
+        row.operator("btools.add_roof")
+
+        col = layout.column(align=True)
+        col.operator("btools.add_balcony")
+        col.operator("btools.add_stairs")
+
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.operator("btools.add_window")
+        row.operator("btools.add_door")
+        col.operator("btools.add_multigroup")
+
+
+class BTOOLS_PT_material_tools(bpy.types.Panel):
+
+    bl_label = "Material Tools"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Building Tools"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj and obj.type == "MESH"
+
+    def draw(self, context):
+        layout = self.layout
+
+        ob = context.object
+        facemap = ob.face_maps.active
+
+        rows = 2
+        if facemap:
+            rows = 4
+
+        if not len(ob.face_maps):
+            return
+
+        layout.label(text="Face Maps")
+
+        row = layout.row()
+        args = ob, "face_maps", ob.face_maps, "active_index"
+        row.template_list("BTOOLS_UL_fmaps", "", *args, rows=rows)
+
+        col = row.column(align=True)
+        col.operator("object.face_map_add", icon="ADD", text="")
+        col.operator("object.face_map_remove", icon="REMOVE", text="")
+        col.separator()
+        col.operator("btools.face_map_clear", icon="TRASH", text="")
+
+        if ob.face_maps and (ob.mode == "EDIT" and ob.type == "MESH"):
+            row = layout.row()
+
+            sub = row.row(align=True)
+            sub.operator("object.face_map_assign", text="Assign")
+            sub.operator("object.face_map_remove_from", text="Remove")
+
+            sub = row.row(align=True)
+            sub.operator("object.face_map_select", text="Select")
+            sub.operator("object.face_map_deselect", text="Deselect")
+
+        layout.label(text="Active Face Map Material")
+        if ob.face_maps:
+            face_map_index = ob.face_maps.active_index
+            face_map_material = ob.facemap_materials[face_map_index]
+            layout.template_ID_preview(face_map_material, "material", hide_buttons=True)
+
+
+classes = (BTOOLS_PT_mesh_tools, BTOOLS_PT_material_tools)
+
+
+def register():
+    register_core()
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    unregister_core()
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    import os
+    os.system("clear")
+
+    # -- custom unregister for script watcher
+    for tp in dir(bpy.types):
+        if 'BTOOLS_' in tp:
+            bpy.utils.unregister_class(getattr(bpy.types, tp))
+
+    register()
+import bpy
+import bmesh
+from enum import Enum, auto
+from functools import wraps
+
+from .util_mesh import get_edit_mesh
+
+
+class AutoIndex(Enum):
+    def _generate_next_value_(name, start, count, last_values):
+        return count
+
+
+class FaceMap(AutoIndex):
+    """ Enum provides names for face_maps """
+
+    SLABS = auto()
+    WALLS = auto()
+
+    FRAME = auto()
+
+    WINDOW = auto()
+    WINDOW_BARS = auto()
+    WINDOW_PANES = auto()
+    WINDOW_LOUVERS = auto()
+
+    DOOR = auto
+    DOOR_PANES = auto()
+    DOOR_PANELS = auto()
+    DOOR_LOUVERS = auto()
+
+    STAIRS = auto()
+    BALCONY = auto()
+
+    RAILING_POSTS = auto()
+    RAILING_WALLS = auto()
+    RAILING_RAILS = auto()
+
+    ROOF = auto()
+    ROOF_HANGS = auto()
+
+
+def map_new_faces(group, skip=None):
+    """ Finds all newly created faces in a function and adds them to a face_map
+        called group.name.lower()
+
+        if skip is provided, then all faces in the face_map called skip.name
+        will not be added to the face_map
+    """
+
+    def outer(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            bm = [arg for arg in args if isinstance(arg, bmesh.types.BMesh)].pop()
+            faces = set(bm.faces)
+
+            result = func(*args, **kwargs)
+
+            new_faces = set(bm.faces) - faces
+            add_faces_to_map(bm, list(new_faces), group, skip)
+            return result
+        return wrapper
+    return outer
+
+
+def add_faces_to_map(bm, faces, group, skip=None):
+    """ Sets the face_map index of faces to the index of the face_map called
+        group.name.lower()
+
+        see map_new_faces for the option *skip*
+    """
+    face_map = bm.faces.layers.face_map.active
+    group_index = face_map_index_from_name(group.name.lower())
+
+    def remove_skipped(f):
+        if skip:
+            skip_index = face_map_index_from_name(skip.name.lower())
+            return not (f[face_map] == skip_index)
+        return True
+
+    for face in list(filter(remove_skipped, faces)):
+        face[face_map] = group_index
+
+    # -- if the facemap already has a material assigned, assign the new faces to the material
+    obj = bpy.context.object
+    mat = obj.facemap_materials[group_index].material
+    mat_id = [idx for idx,  m in enumerate(obj.data.materials) if m == mat]
+    if mat_id:
+        for f in faces:
+            f.material_index = mat_id.pop()
+
+
+def add_facemap_for_groups(groups):
+    """ Creates a face_map called group.name.lower if none exists
+        in the active object
+    """
+    obj = bpy.context.object
+    groups = groups if isinstance(groups, (list, tuple)) else [groups]
+
+    for group in groups:
+        if not obj.face_maps.get(group.name.lower()):
+            obj.face_maps.new(name=group.name.lower())
+            obj.facemap_materials.add()
+
+
+def verify_facemaps_for_object(obj):
+    """ Ensure object has a facemap layer """
+    me = get_edit_mesh()
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.layers.face_map.verify()
+    bmesh.update_edit_mesh(me, True)
+
+
+def set_material_for_active_facemap(material, context):
+    obj = context.object
+    index = obj.face_maps.active_index
+    active_facemap = obj.face_maps[index]
+
+    link_material(obj, material)
+    mat_id = [
+        idx for idx, mat in enumerate(obj.data.materials) if mat == material
+    ].pop()
+
+    me = get_edit_mesh()
+    bm = bmesh.from_edit_mesh(me)
+
+    face_map = bm.faces.layers.face_map.active
+    for face in bm.faces:
+        if face[face_map] == active_facemap.index:
+            face.material_index = mat_id
+
+    bmesh.update_edit_mesh(me, True)
+
+
+def face_map_index_from_name(name):
+    for _, fmap in bpy.context.object.face_maps.items():
+        if fmap.name == name:
+            return fmap.index
+    return -1
+
+
+def link_material(obj, mat):
+    """ link material mat to obj
+    """
+    if not has_material(obj, mat.name):
+        obj.data.materials.append(mat)
+
+
+def has_material(obj, name):
+    """ check if obj has a material with name
+    """
+    return name in obj.data.materials.keys()
+import bpy
+from math import radians
+from mathutils import Vector, Euler
+
+
+def equal(a, b, eps=0.001):
+    """ Check if a and b are approximately equal with a margin of eps
+    """
+    return a == b or (abs(a - b) <= eps)
+
+
+def clamp(value, minimum, maximum):
+    """ Reset value between minimum and maximum
+    """
+    return max(min(value, maximum), minimum)
+
+
+def condition(condition, value_true, value_false):
+    """ Return value_true if condition is True else value_false
+    """
+    return value_true if condition else value_false
+
+
+def ifeven(number, value_even, value_odd):
+    """ Return value_even if number is an even number else value_odd
+    """
+    return condition(number % 2 == 0, value_even, value_odd)
+
+
+def args_from_props(props, names):
+    """ returns a tuple with the properties in props for the given names
+    """
+    return tuple(getattr(props, name) for name in names)
+
+
+def popup_message(message, title="Error", icon='ERROR'):
+    def oops(self, context):
+        self.layout.label(text=message)
+
+    bpy.context.window_manager.popup_menu(oops, title=title, icon=icon)
+
+
+def kwargs_from_props(props):
+    """ Converts all properties in a props{bpy.types.PropertyGroup} into dict
+    """
+    valid_types = (
+        int,
+        str,
+        bool,
+        float,
+        tuple,
+        Vector,
+        bpy.types.Material,
+        bpy.types.Object,
+    )
+
+    result = {}
+    for p in dir(props):
+        if p.startswith("__") or p in ["rna_type", "bl_rna"]:
+            continue
+
+        prop = getattr(props, p)
+        if isinstance(prop, valid_types):
+            result[p] = prop
+        elif isinstance(prop, bpy.types.PropertyGroup) and not isinstance(
+            prop, type(props)
+        ):
+            # property group within this property
+            result.update(kwargs_from_props(prop))
+    return result
+
+
+def restricted_size(parent_dimensions, offset, size_min, size):
+    """ Get size restricted by various factors
+    """
+    limit_x = min(parent_dimensions[0] + 2*offset[0], parent_dimensions[0] - 2*offset[0])
+    limit_y = min(parent_dimensions[1] + 2*offset[1], parent_dimensions[1] - 2*offset[1])
+    x = clamp(size[0], size_min[0], limit_x)
+    y = clamp(size[1], size_min[1], limit_y)
+    return x, y
+
+
+def restricted_offset(parent_dimensions, size, offset):
+    """ Get offset restricted by various factors
+    """
+    limit_x = (parent_dimensions[0]-size[0]) / 2
+    limit_y = (parent_dimensions[1]-size[1]) / 2
+    x = clamp(offset[0], -limit_x, limit_x)
+    y = clamp(offset[1], -limit_y, limit_y)
+    return x, y
+
+
+def local_to_global(face, vec):
+    """ Convert vector from local to global space, considering face normal as local z and world z as local y
+    """
+    x, y, z = local_xyz(face)
+    global_offset = (x * vec.x) + (y * vec.y) + (z * vec.z)
+    return global_offset
+
+
+def local_xyz(face):
+    """ Get local xyz directions
+    """
+    z = face.normal.copy()
+    x = face.normal.copy()
+    x.rotate(Euler((0.0, 0.0, radians(90)), 'XYZ'))
+    y = z.cross(x)
+    return x, y, z
+""" Adapted from https://github.com/yonghah/polyskel
+"""
+
+import math
+import heapq
+import operator
+import itertools as it
+from collections import namedtuple
+
+
+class Vector2:
+    __slots__ = ["x", "y"]
+    __hash__ = None
+
+    def __init__(self, x=0, y=0):
+        self.x = x
+        self.y = y
+
+    def __copy__(self):
+        return self.__class__(self.x, self.y)
+
+    copy = __copy__
+
+    def __repr__(self):
+        return "Vector2(%.2f, %.2f)" % (self.x, self.y)
+
+    def __eq__(self, other):
+        if isinstance(other, Vector2):
+            return self.x == other.x and self.y == other.y
+        else:
+            assert hasattr(other, "__len__") and len(other) == 2
+            return self.x == other[0] and self.y == other[1]
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __nonzero__(self):
+        return bool(self.x != 0 or self.y != 0)
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, key):
+        return (self.x, self.y)[key]
+
+    def __setitem__(self, key, value):
+        items = [self.x, self.y]
+        items[key] = value
+        self.x, self.y = items
+
+    def __iter__(self):
+        return iter((self.x, self.y))
+
+    def __getattr__(self, name):
+        try:
+            return tuple([(self.x, self.y)["xy".index(c)] for c in name])
+        except ValueError:
+            raise AttributeError(name)
+
+    def __add__(self, other):
+        if isinstance(other, Vector2):
+            # Vector + Vector -> Vector
+            # Vector + Point -> Point
+            # Point + Point -> Vector
+            if self.__class__ is other.__class__:
+                _class = Vector2
+            else:
+                _class = Point2
+            return _class(self.x + other.x, self.y + other.y)
+        else:
+            assert hasattr(other, "__len__") and len(other) == 2
+            return Vector2(self.x + other[0], self.y + other[1])
+
+    __radd__ = __add__
+
+    def __iadd__(self, other):
+        if isinstance(other, Vector2):
+            self.x += other.x
+            self.y += other.y
+        else:
+            self.x += other[0]
+            self.y += other[1]
+        return self
+
+    def __sub__(self, other):
+        if isinstance(other, Vector2):
+            if self.__class__ is other.__class__:
+                _class = Vector2
+            else:
+                _class = Point2
+            return _class(self.x - other.x, self.y - other.y)
+        else:
+            assert hasattr(other, "__len__") and len(other) == 2
+            return Vector2(self.x - other[0], self.y - other[1])
+
+    def __rsub__(self, other):
+        if isinstance(other, Vector2):
+            return Vector2(other.x - self.x, other.y - self.y)
+        else:
+            assert hasattr(other, "__len__") and len(other) == 2
+            return Vector2(other.x - self[0], other.y - self[1])
+
+    def __mul__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(self.x * other, self.y * other)
+
+    __rmul__ = __mul__
+
+    def __imul__(self, other):
+        assert type(other) in (int, float)
+        self.x *= other
+        self.y *= other
+        return self
+
+    def __div__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(operator.div(self.x, other), operator.div(self.y, other))
+
+    def __rdiv__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(operator.div(other, self.x), operator.div(other, self.y))
+
+    def __floordiv__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(
+            operator.floordiv(self.x, other), operator.floordiv(self.y, other)
+        )
+
+    def __rfloordiv__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(
+            operator.floordiv(other, self.x), operator.floordiv(other, self.y)
+        )
+
+    def __truediv__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(operator.truediv(self.x, other), operator.truediv(self.y, other))
+
+    def __rtruediv__(self, other):
+        assert type(other) in (int, float)
+        return Vector2(operator.truediv(other, self.x), operator.truediv(other, self.y))
+
+    def __neg__(self):
+        return Vector2(-self.x, -self.y)
+
+    __pos__ = __copy__
+
+    def __abs__(self):
+        return math.sqrt(self.x ** 2 + self.y ** 2)
+
+    magnitude = __abs__
+
+    def magnitude_squared(self):
+        return self.x ** 2 + self.y ** 2
+
+    def normalize(self):
+        d = self.magnitude()
+        if d:
+            self.x /= d
+            self.y /= d
+        return self
+
+    def normalized(self):
+        d = self.magnitude()
+        if d:
+            return Vector2(self.x / d, self.y / d)
+        return self.copy()
+
+    def dot(self, other):
+        assert isinstance(other, Vector2)
+        return self.x * other.x + self.y * other.y
+
+    def cross(self):
+        return Vector2(self.y, -self.x)
+
+    def reflect(self, normal):
+        # assume normal is normalized
+        assert isinstance(normal, Vector2)
+        d = 2 * (self.x * normal.x + self.y * normal.y)
+        return Vector2(self.x - d * normal.x, self.y - d * normal.y)
+
+    def angle(self, other):
+        """Return the angle to the vector other"""
+        return math.acos(self.dot(other) / (self.magnitude() * other.magnitude()))
+
+    def project(self, other):
+        """Return one vector projected on the vector other"""
+        n = other.normalized()
+        return self.dot(n) * n
+
+
+class Geometry:
+    def _connect_unimplemented(self, other):
+        raise AttributeError(
+            "Cannot connect %s to %s" % (self.__class__, other.__class__)
+        )
+
+    def _intersect_unimplemented(self, other):
+        raise AttributeError(
+            "Cannot intersect %s and %s" % (self.__class__, other.__class__)
+        )
+
+    _intersect_point2 = _intersect_unimplemented
+    _intersect_line2 = _intersect_unimplemented
+    _connect_point2 = _connect_unimplemented
+    _connect_line2 = _connect_unimplemented
+
+    def intersect(self, other):
+        raise NotImplementedError
+
+    def connect(self, other):
+        raise NotImplementedError
+
+    def distance(self, other):
+        c = self.connect(other)
+        if c:
+            return c.length
+        return 0.0
+
+
+def _intersect_line2_line2(A, B):
+    d = B.v.y * A.v.x - B.v.x * A.v.y
+    if d == 0:
+        return None
+
+    dy = A.p.y - B.p.y
+    dx = A.p.x - B.p.x
+    ua = (B.v.x * dy - B.v.y * dx) / d
+    if not A._u_in(ua):
+        return None
+    ub = (A.v.x * dy - A.v.y * dx) / d
+    if not B._u_in(ub):
+        return None
+
+    return Point2(A.p.x + ua * A.v.x, A.p.y + ua * A.v.y)
+
+
+def _connect_point2_line2(P, L):
+    d = L.v.magnitude_squared()
+    assert d != 0
+    u = ((P.x - L.p.x) * L.v.x + (P.y - L.p.y) * L.v.y) / d
+    if not L._u_in(u):
+        u = max(min(u, 1.0), 0.0)
+    return LineSegment2(P, Point2(L.p.x + u * L.v.x, L.p.y + u * L.v.y))
+
+
+def _connect_line2_line2(A, B):
+    d = B.v.y * A.v.x - B.v.x * A.v.y
+    if d == 0:
+        # Parallel, connect an endpoint with a line
+        if isinstance(B, Ray2) or isinstance(B, LineSegment2):
+            p1, p2 = _connect_point2_line2(B.p, A)
+            return p2, p1
+        # No endpoint (or endpoint is on A), possibly choose arbitrary point
+        # on line.
+        return _connect_point2_line2(A.p, B)
+
+    dy = A.p.y - B.p.y
+    dx = A.p.x - B.p.x
+    ua = (B.v.x * dy - B.v.y * dx) / d
+    if not A._u_in(ua):
+        ua = max(min(ua, 1.0), 0.0)
+    ub = (A.v.x * dy - A.v.y * dx) / d
+    if not B._u_in(ub):
+        ub = max(min(ub, 1.0), 0.0)
+
+    return LineSegment2(
+        Point2(A.p.x + ua * A.v.x, A.p.y + ua * A.v.y),
+        Point2(B.p.x + ub * B.v.x, B.p.y + ub * B.v.y),
+    )
+
+
+class Point2(Vector2, Geometry):
+    def __repr__(self):
+        return "Point2(%.2f, %.2f)" % (self.x, self.y)
+
+    def __lt__(self, other):
+        if isinstance(other, Vector2):
+            return self.x < other.x
+
+    def __eq__(self, other):
+        if isinstance(other, Vector2):
+            return self.x == other.x and self.y == other.y
+
+    def __hash__(self):
+        return hash(repr(self))
+
+    def intersect(self, other):
+        return other._intersect_point2(self)
+
+    def connect(self, other):
+        return other._connect_point2(self)
+
+    def _connect_point2(self, other):
+        return LineSegment2(other, self)
+
+    def _connect_line2(self, other):
+        c = _connect_point2_line2(self, other)
+        if c:
+            return c._swap()
+
+
+class Line2(Geometry):
+    __slots__ = ["p", "v"]
+
+    def __init__(self, *args):
+        if len(args) == 3:
+            assert (
+                isinstance(args[0], Point2)
+                and isinstance(args[1], Vector2)
+                and type(args[2]) == float
+            )
+            self.p = args[0].copy()
+            self.v = args[1] * args[2] / abs(args[1])
+        elif len(args) == 2:
+            if isinstance(args[0], Point2) and isinstance(args[1], Point2):
+                self.p = args[0].copy()
+                self.v = args[1] - args[0]
+            elif isinstance(args[0], Point2) and isinstance(args[1], Vector2):
+                self.p = args[0].copy()
+                self.v = args[1].copy()
+            else:
+                raise AttributeError("%r" % (args,))
+        elif len(args) == 1:
+            if isinstance(args[0], Line2):
+                self.p = args[0].p.copy()
+                self.v = args[0].v.copy()
+            else:
+                raise AttributeError("%r" % (args,))
+        else:
+            raise AttributeError("%r" % (args,))
+
+        if not self.v:
+            raise AttributeError("Line has zero-length vector")
+
+    def __copy__(self):
+        return self.__class__(self.p, self.v)
+
+    copy = __copy__
+
+    def __repr__(self):
+        return "Line2(<%.2f, %.2f> + u<%.2f, %.2f>)" % (
+            self.p.x,
+            self.p.y,
+            self.v.x,
+            self.v.y,
+        )
+
+    p1 = property(lambda self: self.p)
+    p2 = property(lambda self: Point2(self.p.x + self.v.x, self.p.y + self.v.y))
+
+    def _apply_transform(self, t):
+        self.p = t * self.p
+        self.v = t * self.v
+
+    def _u_in(self, u):
+        return True
+
+    def intersect(self, other):
+        return other._intersect_line2(self)
+
+    def _intersect_line2(self, other):
+        return _intersect_line2_line2(self, other)
+
+    def connect(self, other):
+        return other._connect_line2(self)
+
+    def _connect_point2(self, other):
+        return _connect_point2_line2(other, self)
+
+    def _connect_line2(self, other):
+        return _connect_line2_line2(other, self)
+
+
+class Ray2(Line2):
+    def __repr__(self):
+        return "Ray2(<%.2f, %.2f> + u<%.2f, %.2f>)" % (
+            self.p.x,
+            self.p.y,
+            self.v.x,
+            self.v.y,
+        )
+
+    def _u_in(self, u):
+        return u >= 0.0
+
+
+class LineSegment2(Line2):
+    def __repr__(self):
+        return "LineSegment2(<%.2f, %.2f> to <%.2f, %.2f>)" % (
+            self.p.x,
+            self.p.y,
+            self.p.x + self.v.x,
+            self.p.y + self.v.y,
+        )
+
+    def _u_in(self, u):
+        return u >= 0.0 and u <= 1.0
+
+    def __abs__(self):
+        return abs(self.v)
+
+    def magnitude_squared(self):
+        return self.v.magnitude_squared()
+
+    def _swap(self):
+        # used by connect methods to switch order of points
+        self.p = self.p2
+        self.v *= -1
+        return self
+
+    length = property(lambda self: abs(self.v))
+
+
+def window(lst):
+    prevs, items, nexts = it.tee(lst, 3)
+    prevs = it.islice(it.cycle(prevs), len(lst) - 1, None)
+    nexts = it.islice(it.cycle(nexts), 1, None)
+    return zip(prevs, items, nexts)
+
+
+def cross(a, b):
+    res = a.x * b.y - b.x * a.y
+    return res
+
+
+def approximately_equals(a, b):
+    return a == b or (abs(a - b) <= max(abs(a), abs(b)) * 0.001)
+
+
+def approximately_same(point_a, point_b):
+    return approximately_equals(point_a.x, point_b.x) and approximately_equals(
+        point_a.y, point_b.y
+    )
+
+
+def normalize_contour(contour):
+    contour = [Point2(float(x), float(y)) for (x, y) in contour]
+    return [
+        point
+        for prev, point, next in window(contour)
+        if not (
+            point == next or (point - prev).normalized() == (next - point).normalized()
+        )
+    ]
+
+
+# -- Event Type (etype) is 1
+class SplitEvent(
+    namedtuple("SplitEvent", "distance intersection_point etype vertex opposite_edge")
+):
+    __slots__ = ()
+
+    def __str__(self):
+        return "{} Split event @ {} from {} to {}".format(
+            self.distance, self.intersection_point, self.vertex, self.opposite_edge
+        )
+
+
+# -- Event Type (etype) is 0
+class EdgeEvent(
+    namedtuple("EdgeEvent", "distance intersection_point etype vertex_a vertex_b")
+):
+    __slots__ = ()
+
+    def __str__(self):
+        return "{} Edge event @ {} between {} and {}".format(
+            self.distance, self.intersection_point, self.vertex_a, self.vertex_b
+        )
+
+
+OriginalEdge = namedtuple("_OriginalEdge", "edge bisector_left, bisector_right")
+
+Subtree = namedtuple("Subtree", "source, height, sinks")
+
+
+class LAVertex:
+    def __init__(self, point, edge_left, edge_right, direction_vectors=None):
+        self.point = point
+        self.edge_left = edge_left
+        self.edge_right = edge_right
+        self.prev = None
+        self.next = None
+        self.lav = None
+        self._valid = True
+        # this should be handled better. Maybe membership in lav implies validity?
+
+        creator_vectors = (edge_left.v.normalized() * -1, edge_right.v.normalized())
+        if direction_vectors is None:
+            direction_vectors = creator_vectors
+
+        self._is_reflex = (cross(*direction_vectors)) < 0
+        self._bisector = Ray2(
+            self.point, operator.add(*creator_vectors) * (-1 if self.is_reflex else 1)
+        )
+
+    @property
+    def bisector(self):
+        return self._bisector
+
+    @property
+    def is_reflex(self):
+        return self._is_reflex
+
+    @property
+    def original_edges(self):
+        return self.lav._slav._original_edges
+
+    def next_event(self):
+        events = []
+        if self.is_reflex:
+            for edge in self.original_edges:
+                if edge.edge == self.edge_left or edge.edge == self.edge_right:
+                    continue
+
+                leftdot = abs(
+                    self.edge_left.v.normalized().dot(edge.edge.v.normalized())
+                )
+                rightdot = abs(
+                    self.edge_right.v.normalized().dot(edge.edge.v.normalized())
+                )
+                selfedge = self.edge_left if leftdot < rightdot else self.edge_right
+
+                i = Line2(selfedge).intersect(Line2(edge.edge))
+                if i is not None and not approximately_equals(i, self.point):
+                    # locate candidate b
+                    linvec = (self.point - i).normalized()
+                    edvec = edge.edge.v.normalized()
+                    if linvec.dot(edvec) < 0:
+                        edvec = -edvec
+
+                    bisecvec = edvec + linvec
+                    if abs(bisecvec) == 0:
+                        continue
+                    bisector = Line2(i, bisecvec)
+                    b = bisector.intersect(self.bisector)
+
+                    if b is None:
+                        continue
+
+                    xleft = (
+                        cross(
+                            edge.bisector_left.v.normalized(),
+                            (b - edge.bisector_left.p).normalized(),
+                        )
+                        > 0
+                    )
+                    xright = (
+                        cross(
+                            edge.bisector_right.v.normalized(),
+                            (b - edge.bisector_right.p).normalized(),
+                        )
+                        < 0
+                    )
+                    xedge = (
+                        cross(edge.edge.v.normalized(), (b - edge.edge.p).normalized())
+                        < 0
+                    )
+
+                    if not (xleft and xright and xedge):
+                        continue
+
+                    events.append(
+                        SplitEvent(Line2(edge.edge).distance(b), b, 0, self, edge.edge)
+                    )
+
+        i_prev = self.bisector.intersect(self.prev.bisector)
+        i_next = self.bisector.intersect(self.next.bisector)
+
+        if i_prev is not None:
+            events.append(
+                EdgeEvent(
+                    Line2(self.edge_left).distance(i_prev), i_prev, 1, self.prev, self
+                )
+            )
+        if i_next is not None:
+            events.append(
+                EdgeEvent(
+                    Line2(self.edge_right).distance(i_next), i_next, 1, self, self.next
+                )
+            )
+
+        if not events:
+            return None
+
+        ev = min(
+            events, key=lambda event: self.point.distance(event.intersection_point)
+        )
+
+        return ev
+
+    def invalidate(self):
+        if self.lav is not None:
+            self.lav.invalidate(self)
+        else:
+            self._valid = False
+
+    @property
+    def is_valid(self):
+        return self._valid
+
+    def __str__(self):
+        return "Vertex ({:.2f};{:.2f})".format(self.point.x, self.point.y)
+
+    def __lt__(self, other):
+        if isinstance(other, LAVertex):
+            return self.point.x < other.point.x
+
+    def __repr__(self):
+        return "Vertex ({}) ({:.2f};{:.2f}), bisector {}, edges {} {}".format(
+            "reflex" if self.is_reflex else "convex",
+            self.point.x,
+            self.point.y,
+            self.bisector,
+            self.edge_left,
+            self.edge_right,
+        )
+
+
+class SLAV:
+    def __init__(self, polygon, holes):
+        contours = [normalize_contour(polygon)]
+        contours.extend([normalize_contour(hole) for hole in holes])
+
+        self._lavs = [LAV.from_polygon(contour, self) for contour in contours]
+
+        # store original polygon edges for calculating split events
+        self._original_edges = [
+            OriginalEdge(
+                LineSegment2(vertex.prev.point, vertex.point),
+                vertex.prev.bisector,
+                vertex.bisector,
+            )
+            for vertex in it.chain.from_iterable(self._lavs)
+        ]
+
+    def __iter__(self):
+        for lav in self._lavs:
+            yield lav
+
+    def __len__(self):
+        return len(self._lavs)
+
+    def empty(self):
+        return len(self._lavs) == 0
+
+    def handle_edge_event(self, event):
+        sinks = []
+        events = []
+
+        lav = event.vertex_a.lav
+        if event.vertex_a.prev == event.vertex_b.next:
+            self._lavs.remove(lav)
+            for vertex in list(lav):
+                sinks.append(vertex.point)
+                vertex.invalidate()
+        else:
+            new_vertex = lav.unify(
+                event.vertex_a, event.vertex_b, event.intersection_point
+            )
+            if lav.head in (event.vertex_a, event.vertex_b):
+                lav.head = new_vertex
+            sinks.extend((event.vertex_a.point, event.vertex_b.point))
+            next_event = new_vertex.next_event()
+            if next_event is not None:
+                events.append(next_event)
+
+        return (Subtree(event.intersection_point, event.distance, sinks), events)
+
+    def handle_split_event(self, event):
+        lav = event.vertex.lav
+
+        sinks = [event.vertex.point]
+        vertices = []
+        x = None  # right vertex
+        y = None  # left vertex
+        norm = event.opposite_edge.v.normalized()
+        for v in it.chain.from_iterable(self._lavs):
+            if (
+                norm == v.edge_left.v.normalized()
+                and event.opposite_edge.p == v.edge_left.p
+            ):
+                x = v
+                y = x.prev
+            elif (
+                norm == v.edge_right.v.normalized()
+                and event.opposite_edge.p == v.edge_right.p
+            ):
+                y = v
+                x = y.next
+
+            if x:
+                xleft = (
+                    cross(
+                        y.bisector.v.normalized(),
+                        (event.intersection_point - y.point).normalized(),
+                    )
+                    >= 0
+                )
+                xright = (
+                    cross(
+                        x.bisector.v.normalized(),
+                        (event.intersection_point - x.point).normalized(),
+                    )
+                    <= 0
+                )
+
+                if xleft and xright:
+                    break
+                else:
+                    x = None
+                    y = None
+
+        if x is None:
+            return (None, [])
+
+        v1 = LAVertex(
+            event.intersection_point, event.vertex.edge_left, event.opposite_edge
+        )
+        v2 = LAVertex(
+            event.intersection_point, event.opposite_edge, event.vertex.edge_right
+        )
+
+        v1.prev = event.vertex.prev
+        v1.next = x
+        event.vertex.prev.next = v1
+        x.prev = v1
+
+        v2.prev = y
+        v2.next = event.vertex.next
+        event.vertex.next.prev = v2
+        y.next = v2
+
+        new_lavs = None
+        self._lavs.remove(lav)
+        if lav != x.lav:
+            # the split event actually merges two lavs
+            self._lavs.remove(x.lav)
+            new_lavs = [LAV.from_chain(v1, self)]
+        else:
+            new_lavs = [LAV.from_chain(v1, self), LAV.from_chain(v2, self)]
+
+        for l in new_lavs:
+            if len(l) > 2:
+                self._lavs.append(l)
+                vertices.append(l.head)
+            else:
+                sinks.append(l.head.next.point)
+                for v in list(l):
+                    v.invalidate()
+
+        events = []
+        for vertex in vertices:
+            next_event = vertex.next_event()
+            if next_event is not None:
+                events.append(next_event)
+
+        event.vertex.invalidate()
+        return (Subtree(event.intersection_point, event.distance, sinks), events)
+
+
+class LAV:
+    def __init__(self, slav):
+        self.head = None
+        self._slav = slav
+        self._len = 0
+
+    @classmethod
+    def from_polygon(cls, polygon, slav):
+        lav = cls(slav)
+        for prev, point, next in window(polygon):
+            lav._len += 1
+            vertex = LAVertex(
+                point, LineSegment2(prev, point), LineSegment2(point, next)
+            )
+            vertex.lav = lav
+            if lav.head is None:
+                lav.head = vertex
+                vertex.prev = vertex.next = vertex
+            else:
+                vertex.next = lav.head
+                vertex.prev = lav.head.prev
+                vertex.prev.next = vertex
+                lav.head.prev = vertex
+        return lav
+
+    @classmethod
+    def from_chain(cls, head, slav):
+        lav = cls(slav)
+        lav.head = head
+        for vertex in lav:
+            lav._len += 1
+            vertex.lav = lav
+        return lav
+
+    def invalidate(self, vertex):
+        assert vertex.lav is self, "Tried to invalidate a vertex that's not mine"
+        vertex._valid = False
+        if self.head == vertex:
+            self.head = self.head.next
+        vertex.lav = None
+
+    def unify(self, vertex_a, vertex_b, point):
+        replacement = LAVertex(
+            point,
+            vertex_a.edge_left,
+            vertex_b.edge_right,
+            (vertex_b.bisector.v.normalized(), vertex_a.bisector.v.normalized()),
+        )
+        replacement.lav = self
+
+        if self.head in [vertex_a, vertex_b]:
+            self.head = replacement
+
+        vertex_a.prev.next = replacement
+        vertex_b.next.prev = replacement
+        replacement.prev = vertex_a.prev
+        replacement.next = vertex_b.next
+
+        vertex_a.invalidate()
+        vertex_b.invalidate()
+
+        self._len -= 1
+        return replacement
+
+    def __str__(self):
+        return "LAV {}".format(id(self))
+
+    def __repr__(self):
+        return "{} = {}".format(str(self), [vertex for vertex in self])
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        cur = self.head
+        while True:
+            yield cur
+            cur = cur.next
+            if cur == self.head:
+                return
+
+    def _show(self):
+        cur = self.head
+        while True:
+            print(cur.__repr__())
+            cur = cur.next
+            if cur == self.head:
+                break
+
+
+class EventQueue:
+    def __init__(self):
+        self.__data = []
+
+    def put(self, item):
+        if item is not None:
+            heapq.heappush(self.__data, item)
+
+    def put_all(self, iterable):
+        for item in iterable:
+            heapq.heappush(self.__data, item)
+
+    def get(self):
+        return heapq.heappop(self.__data)
+
+    def empty(self):
+        return len(self.__data) == 0
+
+    def peek(self):
+        return self.__data[0]
+
+    def show(self):
+        for item in self.__data:
+            print(item)
+
+
+def skeletonize(polygon, holes=None):
+    """
+    Compute the straight skeleton of a polygon.
+
+    The polygon should be given as a list of vertices in counter-clockwise order.
+    Holes is a list of the contours of the holes, the vertices of which should be in clockwise order.
+
+    Returns the straight skeleton as a list of "subtrees", which are in the form of (source, height, sinks),
+    where source is the highest points, height is its height, and sinks are the point connected to the source.
+    """
+    slav = SLAV(polygon, holes)
+    output = []
+    prioque = EventQueue()
+
+    for lav in slav:
+        for vertex in lav:
+            v = vertex.next_event()
+            prioque.put(v)
+
+    while not (prioque.empty() or slav.empty()):
+        i = prioque.get()
+        if isinstance(i, EdgeEvent):
+            if not i.vertex_a.is_valid or not i.vertex_b.is_valid:
+                continue
+            (arc, events) = slav.handle_edge_event(i)
+
+        elif isinstance(i, SplitEvent):
+            if not i.vertex.is_valid:
+                continue
+            (arc, events) = slav.handle_split_event(i)
+
+        prioque.put_all(events)
+
+        if arc is not None:
+            output.append(arc)
+
+    return output
+import bmesh
+import itertools as it
+from mathutils import Matrix, Vector
+
+from .util_mesh import face_with_verts
+
+
+def cube(bm, width=2, length=2, height=2):
+    """ Create a cube in the given bmesh
+    """
+    sc_x = Matrix.Scale(width, 4, (1, 0, 0))
+    sc_y = Matrix.Scale(length, 4, (0, 1, 0))
+    sc_z = Matrix.Scale(height, 4, (0, 0, 1))
+    mat = sc_x @ sc_y @ sc_z
+    return bmesh.ops.create_cube(bm, size=1, matrix=mat)
+
+
+def plane(bm, width=2, length=2):
+    """ Create a plane in the given bmesh
+    """
+    sc_x = Matrix.Scale(width, 4, (1, 0, 0))
+    sc_y = Matrix.Scale(length, 4, (0, 1, 0))
+    mat = sc_x @ sc_y
+    return bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=1, matrix=mat)
+
+
+def circle(bm, radius=1, segs=10, cap_tris=False):
+    """ Create circle in the bmesh
+    """
+    return bmesh.ops.create_circle(
+        bm, cap_ends=True, cap_tris=cap_tris, segments=segs, radius=radius
+    )
+
+
+def cone(bm, r1=0.5, r2=0.01, height=2, segs=32):
+    """ Create a cone in the bmesh
+    """
+    return bmesh.ops.create_cone(
+        bm,
+        diameter1=r1 * 2,
+        diameter2=r2 * 2,
+        depth=height,
+        cap_ends=True,
+        cap_tris=True,
+        segments=segs,
+    )
+
+
+def cylinder(bm, radius=1, height=2, segs=10):
+    """ Create cylinder in bmesh
+    """
+    circle = bmesh.ops.create_circle(
+        bm, cap_ends=True, cap_tris=False, segments=segs, radius=radius
+    )
+
+    verts = circle["verts"]
+    face = list(verts[0].link_faces)
+
+    cylinder = bmesh.ops.extrude_discrete_faces(bm, faces=face)
+    bmesh.ops.translate(bm, verts=cylinder["faces"][-1].verts, vec=(0, 0, height))
+
+    result = {"verts": verts + list(cylinder["faces"][-1].verts)}
+    bmesh.ops.translate(bm, verts=result["verts"], vec=(0, 0, -height / 2))
+    return result
+
+
+"""
+Convinience functions
+"""
+
+
+def create_cube(bm, size, position=Vector()):
+    """ Create cube with size and at position
+    """
+    geom = cube(bm, *size)
+    bmesh.ops.translate(bm, verts=geom["verts"], vec=position)
+    return geom
+
+
+def create_cylinder(bm, radius, height, segs, position=Vector()):
+    """ Create cylinder at position
+    """
+    cy = cylinder(bm, radius, height, segs)
+    bmesh.ops.translate(bm, verts=cy["verts"], vec=position)
+    return cy
+
+
+def create_cube_without_faces(bm, size, position=Vector(), **directions):
+    """ Create cube without faces in the given directions
+    """
+    cube = create_cube(bm, size, position)
+
+    def D(direction):
+        return directions.get(direction, False)
+
+    vts = cube["verts"]
+    keys = ["z", "z", "x", "x", "y", "y"]
+    dirs = [D("top"), D("bottom"), D("left"), D("right"), D("front"), D("back")]
+    slcs = it.chain.from_iterable(it.repeat([slice(4, 8), slice(4)], 3))
+
+    faces = []
+    for direction, key, _slice in zip(dirs, keys, slcs):
+        if direction:
+            vts.sort(key=lambda v: getattr(v.co, key))
+            faces.append(face_with_verts(bm, vts[_slice]))
+
+    bmesh.ops.delete(bm, geom=faces, context="FACES_ONLY")
+    return cube
+import bpy
+import bmesh
+
+from .util_mesh import select
+
+
+def create_object(name, data=None):
+    """ Make new object data
+    """
+    return bpy.data.objects.new(name, data)
+
+
+def bm_from_obj(obj):
+    """ Create bmesh from object data
+    """
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    return bm
+
+
+def bm_to_obj(bm, obj):
+    """ Write bmesh to object data
+    """
+    bm.to_mesh(obj.data)
+    bm.free()
+
+
+def link_obj(obj):
+    """ Link object to active scene
+    """
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    select(bpy.context.view_layer.objects, False)
+    obj.select_set(True)
+    obj.location = bpy.context.scene.cursor.location
+
+
+def obj_clear_data(obj):
+    """ Removes mesh geometry data from obj
+    """
+    bm = bm_from_obj(obj)
+    bmesh.ops.delete(bm, geom=list(bm.verts), context=1)
+    bm_to_obj(bm, obj)
+from .util_mesh import *
+from .util_common import *
+from .util_object import *
+from .util_geometry import *
+from .util_material import *
+from .util_skeleton import skeletonize
+import bpy
+import math
+import bmesh
+import operator
+import functools as ft
+from mathutils import Vector
+from bmesh.types import BMVert, BMEdge, BMFace
+from .util_common import local_xyz, equal
+
+
+def get_edit_mesh():
+    """ Get editmode mesh
+    """
+    return bpy.context.edit_object.data
+
+
+def create_mesh(name):
+    """ Make new mesh data
+    """
+    return bpy.data.meshes.new(name)
+
+
+def select(elements, val=True):
+    """ For each item in elements set select to val
+    """
+    for el in elements:
+        el.select_set(val)
+
+
+def validate(elements):
+    """ Return only valid items in elements
+    """
+    return list(filter(lambda el: el.is_valid, elements))
+
+
+def filter_geom(geom, _type):
+    """ Find all elements of type _type in geom iterable
+    """
+    return list(filter(lambda x: isinstance(x, _type), geom))
+
+
+def edge_tangent(edge):
+    """ Find the tangent of an edge
+    """
+    tan = None
+    for l in edge.link_loops:
+        t = edge.calc_tangent(l)
+        if not round(t.z):
+            tan = t
+    return tan
+
+
+def edge_vector(edge):
+    """ Return the normalized vector between edge vertices
+    """
+    v1, v2 = edge.verts
+    return (v2.co - v1.co).normalized()
+
+
+def valid_ngon(face):
+    """ faces with rectangular shape and undivided horizontal edges are valid
+    """
+    horizontal_edges = filter_horizontal_edges(face.edges, face.normal)
+    return len(horizontal_edges) == 2 and is_rectangle(face)
+
+
+def is_rectangle(face):
+    """ check if face is rectangular
+    """
+    angles = [math.pi - l.calc_angle() for l in face.loops]
+    right_angles = len([a for a in angles if math.pi/2-0.001 < a < math.pi/2+0.001])
+    straight_angles = len([a for a in angles if -0.001 < a < 0.001])
+    return right_angles == 4 and straight_angles == len(angles) - 4
+
+
+def vec_equal(a, b):
+    angle = a.angle(b)
+    return angle < 0.001 and angle > -0.001
+
+
+def vec_opposite(a, b):
+    angle = a.angle(b)
+    return angle < math.pi + 0.001 and angle > math.pi - 0.001
+
+
+def is_parallel(a, b):
+    return vec_equal(a, b) or vec_opposite(a, b)
+
+
+def sort_edges_clockwise(edges):
+    """ sort edges clockwise based on angle from their median center
+    """
+    median_reference = ft.reduce(operator.add, map(calc_edge_median, edges)) / len(
+        edges
+    )
+
+    def sort_function(edge):
+        vector_difference = median_reference - calc_edge_median(edge)
+        return math.atan2(vector_difference.y, vector_difference.x)
+
+    return sorted(edges, key=sort_function, reverse=True)
+
+
+def filter_vertical_edges(edges, normal):
+    """ Determine edges that are vertical based on a normal value
+    """
+    res = []
+    rnd = ft.partial(round, ndigits=3)
+
+    for e in edges:
+        if rnd(normal.x):
+            s = set([rnd(v.co.y) for v in e.verts])
+        else:
+            s = set([rnd(v.co.x) for v in e.verts])
+
+        if len(s) == 1:
+            res.append(e)
+    return res
+
+
+def filter_horizontal_edges(edges, normal):
+    """ Determine edges that are horizontal based on a normal value
+    """
+    res = []
+    rnd = ft.partial(round, ndigits=3)
+
+    for e in edges:
+        if rnd(normal.z):
+            s = set([rnd(v.co.y) for v in e.verts])
+        else:
+            s = set([rnd(v.co.z) for v in e.verts])
+
+        if len(s) == 1:
+            res.append(e)
+    return res
+
+
+def filter_parallel_edges(edges, dir):
+    """ Determine edges that are parallel to a vector
+    """
+    return [e for e in edges if is_parallel(edge_vector(e), dir)]
+
+
+def calc_edge_median(edge):
+    """ Calculate the center position of edge
+    """
+    return calc_verts_median(edge.verts)
+
+
+def calc_verts_median(verts):
+    """ Determine the median position of verts
+    """
+    return ft.reduce(operator.add, [v.co for v in verts]) / len(verts)
+
+
+def calc_face_dimensions(face):
+    """ Determine the width and height of face
+    """
+    horizontal_edges = filter_horizontal_edges(face.edges, face.normal)
+    vertical_edges = filter_vertical_edges(face.edges, face.normal)
+    width = sum(e.calc_length() for e in horizontal_edges)/2
+    height = sum(e.calc_length() for e in vertical_edges)/2
+    return width, height
+
+
+def face_with_verts(bm, verts, default=None):
+    """ Find a face in the bmesh with the given verts
+    """
+    for face in bm.faces:
+        equal = map(
+            operator.eq,
+            sorted(verts, key=operator.attrgetter('index')),
+            sorted(face.verts, key=operator.attrgetter('index')),
+        )
+        if len(face.verts) == len(verts) and all(equal):
+            return face
+    return default
+
+
+def subdivide_face_horizontally(bm, face, widths):
+    """ Subdivide the face horizontally, widths from left to right (face x axis)
+    """
+    if len(widths) < 2:
+        return [face]
+    edges = filter_horizontal_edges(face.edges, face.normal)
+    direction, _, _ = local_xyz(face)
+    inner_edges = subdivide_edges(bm, edges, direction, widths)
+    return sort_faces(list({f for e in inner_edges for f in e.link_faces}), direction)
+
+
+def subdivide_face_vertically(bm, face, widths):
+    """ Subdivide the face vertically, widths from bottom to top (face y axis)
+    """
+    if len(widths) < 2:
+        return [face]
+    edges = filter_vertical_edges(face.edges, face.normal)
+    _, direction, _ = local_xyz(face)
+    inner_edges = subdivide_edges(bm, edges, direction, widths)
+    return sort_faces(list({f for e in inner_edges for f in e.link_faces}), direction)
+
+
+def subdivide_edges(bm, edges, direction, widths):
+    """ Subdivide edges in a direction, widths in the direction
+    """
+    dir = direction.copy()
+    cuts = len(widths) - 1
+    res = bmesh.ops.subdivide_edges(bm, edges=edges, cuts=cuts)
+    inner_edges = filter_geom(res.get("geom_inner"), BMEdge)
+    distance = sum(widths)/len(widths)
+    final_position = 0.0
+    for i, edge in enumerate(sort_edges(inner_edges, dir)):
+        original_position = (i+1) * distance
+        final_position += widths[i]
+        diff = final_position - original_position
+        bmesh.ops.translate(bm, verts=edge.verts, vec=diff*dir)
+    return inner_edges
+
+
+def arc_edge(bm, edge, resolution, height, offset, xyz, function="SPHERE"):
+    """ Subdivide the given edge and offset vertices to form an arc
+    """
+    length = edge.calc_length()
+    median = calc_edge_median(edge)
+
+    ret = bmesh.ops.subdivide_edges(bm, edges=[edge], cuts=resolution)
+    verts = sort_verts(
+        list({v for e in filter_geom(ret["geom_split"], bmesh.types.BMEdge) for v in e.verts}),
+        xyz[0]
+    )
+    theta = math.pi / (len(verts) - 1)
+
+    def arc_sine(verts):
+        for idx, v in enumerate(verts):
+            v.co.z += math.sin(theta * idx) * height
+
+    def arc_sphere(verts):
+        for idx, v in enumerate(verts):
+            angle = math.pi - (theta * idx)
+            v.co = median + xyz[0] * math.cos(angle) * length/2
+            v.co.z += math.sin(angle) * height
+
+    {"SINE": arc_sine, "SPHERE": arc_sphere}.get(function)(verts)
+    return ret
+
+
+def extrude_face(bm, face, extrude_depth):
+    """extrude a face
+    """
+    extruded_face = bmesh.ops.extrude_discrete_faces(bm, faces=[face]).get("faces")[0]
+    bmesh.ops.translate(bm, verts=extruded_face.verts, vec=extruded_face.normal * extrude_depth)
+    surrounding_faces = list({f for edge in extruded_face.edges for f in edge.link_faces if f not in [extruded_face]})
+    return extruded_face, surrounding_faces
+
+
+def extrude_face_region(bm, faces, depth, normal):
+    """extrude a face and delete redundant faces
+    """
+    initial_locations = [f.calc_center_bounds() for f in faces]
+    geom = bmesh.ops.extrude_face_region(bm, geom=faces).get("geom")
+    verts = filter_geom(geom, BMVert)
+    bmesh.ops.translate(bm, verts=verts, vec=normal * depth)
+
+    bmesh.ops.delete(bm, geom=faces, context="FACES")  # remove redundant faces
+
+    extruded_faces = filter_geom(geom, BMFace)
+    # order extruded faces as per initially passed
+    final_locations = [loc+depth*normal for loc in initial_locations]
+    extruded_faces = closest_faces(extruded_faces, final_locations)
+    surrounding_faces = list({f for edge in filter_geom(geom, BMEdge) for f in edge.link_faces if f not in extruded_faces})
+    return extruded_faces, surrounding_faces
+
+
+def closest_faces(faces, locations):
+    def get_face(faces, location):
+        for f in faces:
+            if equal((f.calc_center_bounds()-location).length, 0):
+                return f
+    return [get_face(faces, l) for l in locations]
+
+
+def get_selected_face_dimensions(context):
+    """ Get dimensions of selected face
+    """
+    bm = bmesh.from_edit_mesh(context.edit_object.data)
+    wall = [f for f in bm.faces if f.select]
+    if wall:
+        return calc_face_dimensions(wall[0])
+    return 1, 1
+
+
+def create_face(bm, size, offset, xyz):
+    """ Create a face in xy plane of xyz space
+    """
+    offset = offset.x * xyz[0] + offset.y * xyz[1]
+
+    v1 = bmesh.ops.create_vert(bm, co=offset+size.x*xyz[0]/2+size.y*xyz[1]/2)["vert"][0]
+    v2 = bmesh.ops.create_vert(bm, co=offset+size.x*xyz[0]/2-size.y*xyz[1]/2)["vert"][0]
+    v3 = bmesh.ops.create_vert(bm, co=offset-size.x*xyz[0]/2+size.y*xyz[1]/2)["vert"][0]
+    v4 = bmesh.ops.create_vert(bm, co=offset-size.x*xyz[0]/2-size.y*xyz[1]/2)["vert"][0]
+
+    return bmesh.ops.contextual_create(bm, geom=[v1, v2, v3, v4])["faces"][0]
+
+
+def get_top_edges(edges, n=1):
+    return sort_edges(edges, Vector((0, 0, -1)))[:n]
+
+
+def get_bottom_edges(edges, n=1):
+    return sort_edges(edges, Vector((0, 0, 1)))[:n]
+
+
+def get_top_faces(faces, n=1):
+    return sort_faces(faces, Vector((0, 0, -1)))[:n]
+
+
+def get_bottom_faces(faces, n=1):
+    return sort_faces(faces, Vector((0, 0, 1)))[:n]
+
+
+def sort_faces(faces, direction):
+    return sorted(faces, key=lambda f: direction.dot(f.calc_center_median()))
+
+
+def sort_edges(edges, direction):
+    return sorted(edges, key=lambda e: direction.dot(calc_edge_median(e)))
+
+
+def sort_verts(verts, direction):
+    return sorted(verts, key=lambda v: direction.dot(v.co))
+from .fill import register_fill, unregister_fill
+from .door import register_door, unregister_door
+from .roof import register_roof, unregister_roof
+from .floor import register_floor, unregister_floor
+from .stairs import register_stairs, unregister_stairs
+from .window import register_window, unregister_window
+from .railing import register_railing, unregister_railing
+from .balcony import register_balcony, unregister_balcony
+from .generic import register_generic, unregister_generic
+from .floorplan import register_floorplan, unregister_floorplan
+from .multigroup import register_multigroup, unregister_multigroup
+
+
+# -- ORDER MATTERS --
+register_funcs = (
+    register_generic,
+    register_railing,
+    register_balcony,
+    register_fill,
+    register_door,
+    register_floor,
+    register_window,
+    register_floorplan,
+    register_stairs,
+    register_roof,
+    register_multigroup,
+)
+
+unregister_funcs = (
+    unregister_generic,
+    unregister_railing,
+    unregister_balcony,
+    unregister_fill,
+    unregister_door,
+    unregister_floor,
+    unregister_window,
+    unregister_floorplan,
+    unregister_stairs,
+    unregister_roof,
+    unregister_multigroup,
+)
+
+
+def register_core():
+    for func in register_funcs:
+        func()
+
+
+def unregister_core():
+    for func in unregister_funcs:
+        func()
+from ..utils import (
+    extrude_face_region,
+)
+
+
+def add_frame_depth(bm, door_faces, window_faces, arch_faces, frame_faces, depth, normal):
+    """ Add depth to frame
+    """
+    if depth != 0.0:
+        n_doors = len(door_faces)
+        n_windows = len(window_faces)
+        n_arch = len(arch_faces)
+        all_faces = door_faces + window_faces + arch_faces + frame_faces
+        all_faces, surrounding_faces = extrude_face_region(bm, all_faces, -depth, normal)
+        if depth < 0.0:
+            return all_faces[:n_doors], all_faces[n_doors:n_doors+n_windows], all_faces[n_doors+n_windows: n_doors+n_windows+n_arch], all_faces[n_doors+n_windows+n_arch:] + surrounding_faces
+        else:
+            return all_faces[:n_doors], all_faces[n_doors:n_doors+n_windows], all_faces[n_doors+n_windows: n_doors+n_windows+n_arch], all_faces[n_doors+n_windows+n_arch:]
+    else:
+        return door_faces, window_faces, arch_faces, frame_faces
+import bpy
+import bmesh
+from bpy.props import (
+    IntProperty,
+    EnumProperty,
+    BoolProperty,
+    FloatProperty,
+    PointerProperty,
+    CollectionProperty,
+    FloatVectorProperty,
+)
+
+from ..utils import (
+    clamp,
+    get_edit_mesh,
+    restricted_size,
+    restricted_offset,
+    set_material_for_active_facemap,
+)
+
+
+def get_count(self):
+    """ Return count value with a default of 1
+    """
+    return self.get('count', 1)
+
+
+def set_count(self, value):
+    """ Set count value ensuring that element fit nicely in parent
+    """
+    # -- Make each element in array fit into the parent
+    parent_width = self['wall_dimensions'][0]
+    if self.size_offset.size.x > parent_width / value:
+        self.size_offset.size.x = parent_width / value
+
+    # -- keep horizontal offset within bounds of parent face
+    element_width = parent_width / value
+    item_width = self.size_offset.size.x
+    max_offset = (element_width / 2) - (item_width / 2)
+    self.size_offset.offset.x = clamp(self.size_offset.offset.x, -max_offset, max_offset)
+
+    # -- set count
+    self['count'] = value
+
+
+def clamp_count(face_width, frame_width, prop):
+    prop.count = clamp(prop.count, 1, int(face_width / frame_width) - 1)
+
+
+CountProperty = IntProperty(
+    name="Count",
+    min=1,
+    max=100,
+    set=set_count,
+    get=get_count,
+    description="Number of elements",
+)
+
+
+class SizeOffsetProperty(bpy.types.PropertyGroup):
+    """ Convinience PropertyGroup used for regular Quad Inset (see window and door)"""
+
+    def get_size(self):
+        if self['restricted']:
+            return self.get("size", restricted_size(
+                self['parent_dimensions'], self.offset, (0.1, 0.1), self['default_size']
+            ))
+        else:
+            return self.get("size", self['default_size'])
+
+    def set_size(self, value):
+        if self['restricted']:
+            value = (clamp(value[0], 0.1, self["parent_dimensions"][0] - 0.0001), value[1])
+            self["size"] = restricted_size(
+                self['parent_dimensions'], self.offset, (0.1, 0.1), value
+            )
+        else:
+            self["size"] = value
+
+    size: FloatVectorProperty(
+        name="Size",
+        get=get_size,
+        set=set_size,
+        subtype="XYZ",
+        size=2,
+        description="Size of geometry",
+    )
+
+    def get_offset(self):
+        return self.get("offset", self['default_offset'])
+
+    def set_offset(self, value):
+        self["offset"] = restricted_offset(self['parent_dimensions'], self.size, value) if self['restricted'] else value
+
+    offset: FloatVectorProperty(
+        name="Offset",
+        get=get_offset,
+        set=set_offset,
+        subtype="TRANSLATION",
+        size=2,
+        description="How much to offset geometry",
+    )
+
+    show_props: BoolProperty(default=False)
+
+    def init(self, parent_dimensions, default_size=(1.0, 1.0), default_offset=(0.0, 0.0), restricted=True):
+        self['parent_dimensions'] = parent_dimensions
+        self['default_size'] = default_size
+        self['default_offset'] = default_offset
+        self['restricted'] = restricted
+
+    def draw(self, context, box):
+
+        row = box.row(align=False)
+        col = row.column(align=True)
+        col.prop(self, "size")
+
+        col = row.column(align=True)
+        col.prop(self, "offset")
+
+
+class ArchProperty(bpy.types.PropertyGroup):
+    """ Convinience PropertyGroup to create arched features """
+    def get_height(self):
+        return self.get("height", min(self['parent_height'], self["default_height"]))
+
+    def set_height(self, value):
+        self["height"] = clamp(value, 0.1, self["parent_height"] - 0.0001)
+
+    resolution: IntProperty(
+        name="Arc Resolution",
+        min=1,
+        max=128,
+        default=6,
+        description="Number of segements for the arc",
+    )
+
+    depth: FloatProperty(
+        name="Arc Depth",
+        min=0.01,
+        max=1.0,
+        default=0.05,
+        description="How far arc is from top",
+    )
+
+    height: FloatProperty(
+        name="Arc Height",
+        get=get_height,
+        set=set_height,
+        description="Radius of the arc",
+    )
+
+    func_items = [("SINE", "Sine", "", 0), ("SPHERE", "Sphere", "", 1)]
+    function: EnumProperty(
+        name="Offset Function",
+        items=func_items,
+        default="SPHERE",
+        description="Type of offset for arch",
+    )
+
+    def init(self, parent_height):
+        self['parent_height'] = parent_height
+        self['default_height'] = 0.4
+
+    def draw(self, context, box):
+
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "function", expand=True)
+        col.prop(self, "resolution")
+        col.prop(self, "depth")
+        col.prop(self, "height")
+
+
+class BTOOLS_UL_fmaps(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, icon, skip, _skip, _skip_):
+        fmap = item
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            layout.prop(fmap, "name", text="", emboss=False, icon="FACE_MAPS")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon_value=icon)
+
+
+class BTOOLS_OT_fmaps_clear(bpy.types.Operator):
+    """Remove all empty face maps"""
+
+    bl_idname = "btools.face_map_clear"
+    bl_label = "Clear empty face maps"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.object
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+
+        face_map = bm.faces.layers.face_map.active
+        used_indices = {f[face_map] for f in bm.faces}
+        all_indices = {f.index for f in obj.face_maps}
+        tag_remove_indices = all_indices - used_indices
+
+        # -- remove face maps
+        tag_remove_maps = [obj.face_maps[idx] for idx in tag_remove_indices]
+        for fmap in tag_remove_maps:
+            obj.face_maps.remove(fmap)
+
+        # -- remove facemap materials:
+        for idx in reversed(list(tag_remove_indices)):
+            obj.facemap_materials.remove(idx)
+
+        bmesh.update_edit_mesh(me, True)
+        return {"FINISHED"}
+
+
+class TrackedProperty(bpy.types.PropertyGroup):
+    """ Convinience property group to keep track of properties being
+        shared between modules
+    """
+
+    slab_outset: FloatProperty()
+
+
+def update_facemap_material(self, context):
+    """ Assign the updated material to all faces belonging to active facemap
+    """
+    set_material_for_active_facemap(self.material, context)
+    return None
+
+
+class FaceMapMaterial(bpy.types.PropertyGroup):
+    """ Tracks materials for each facemap created for an object
+    """
+
+    material: PointerProperty(type=bpy.types.Material, update=update_facemap_material)
+
+
+classes = (
+    ArchProperty,
+    FaceMapMaterial,
+    TrackedProperty,
+    BTOOLS_UL_fmaps,
+    SizeOffsetProperty,
+    BTOOLS_OT_fmaps_clear,
+)
+
+
+def register_generic():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    bpy.types.Object.tracked_properties = PointerProperty(type=TrackedProperty)
+    bpy.types.Object.facemap_materials = CollectionProperty(type=FaceMapMaterial)
+
+
+def unregister_generic():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+
+    del bpy.types.Object.facemap_materials
+    del bpy.types.Object.tracked_properties
+from .register import register_core, unregister_core
+import bmesh
+from bmesh.types import BMEdge
+from ..utils import (
+    add_facemap_for_groups,
+    sort_verts,
+    filter_geom,
+    map_new_faces,
+    FaceMap,
+    arc_edge,
+    get_bottom_faces,
+    extrude_face_region,
+)
+
+
+def fill_arch(bm, face, prop):
+    """ Fill arch
+    """
+    if prop.fill_type == "GLASS_PANES":
+        add_facemap_for_groups(FaceMap.DOOR_PANES)
+        pane_arch_face(bm, face, prop.glass_fill)
+
+
+def create_arch(bm, top_edges, frame_faces, arch_prop, frame_thickness, xyz):
+    """ Create arch using top edges of extreme frames
+    """
+    verts = sort_verts([v for e in top_edges for v in e.verts], xyz[0])
+    arc_edges = [
+        bmesh.ops.connect_verts(bm, verts=[verts[0], verts[-1]])['edges'].pop(),
+        bmesh.ops.connect_verts(bm, verts=[verts[1], verts[-2]])['edges'].pop(),
+    ]
+
+    upper_arc = filter_geom(arc_edge(bm, arc_edges[0], arch_prop.resolution, arch_prop.height, arch_prop.depth, xyz, arch_prop.function)["geom_split"], BMEdge)
+    lower_arc = filter_geom(arc_edge(bm, arc_edges[1], arch_prop.resolution, arch_prop.height-frame_thickness, arch_prop.depth, xyz, arch_prop.function)["geom_split"], BMEdge)
+    arc_edges = [
+        *upper_arc,
+        *lower_arc,
+    ]
+
+    arc_face = min(upper_arc[arch_prop.resolution//2].link_faces, key=lambda f: f.calc_center_median().z)
+    bmesh.ops.delete(bm, geom=[arc_face], context="FACES")
+
+    arch_frame_faces = bmesh.ops.bridge_loops(bm, edges=arc_edges)["faces"]
+    arch_face = min(lower_arc[arch_prop.resolution//2].link_faces, key=lambda f: f.calc_center_median().z)
+
+    if len(verts) == 4: # corner case
+        verts = sort_verts([v for e in top_edges for v in e.verts], xyz[0])
+        new_edge = bmesh.ops.connect_verts(bm, verts=[verts[1], verts[-2]])['edges'].pop()
+        new_face = get_bottom_faces(new_edge.link_faces).pop()
+        arch_frame_faces.append(new_face)
+
+    return arch_face, arch_frame_faces
+
+
+@map_new_faces(FaceMap.DOOR_PANES)
+def pane_arch_face(bm, face, prop):
+    bmesh.ops.inset_individual(
+        bm, faces=[face], thickness=prop.pane_margin * 0.75, use_even_offset=True
+    )
+    bmesh.ops.translate(
+        bm, verts=face.verts, vec=-face.normal * prop.pane_depth
+    )
+
+
+def add_arch_depth(bm, arch_face, depth, normal):
+    """ Add depth to arch face
+    """
+    if depth > 0.0:
+        arch_faces, frame_faces = extrude_face_region(bm, [arch_face], -depth, normal)
+        return arch_faces[0], frame_faces
+    else:
+        return arch_face, []
+import bmesh
+import mathutils
+from mathutils import Vector, Matrix
+from bmesh.types import BMVert, BMEdge, BMFace
+from ...utils import (
+    equal,
+    select,
+    FaceMap,
+    validate,
+    edge_vector,
+    skeletonize,
+    filter_geom,
+    popup_message,
+    map_new_faces,
+    calc_edge_median,
+    add_faces_to_map,
+    calc_verts_median,
+    add_facemap_for_groups,
+)
+
+
+def create_roof(bm, faces, prop):
+    """Create roof types
+    """
+    select(faces, False)
+    if prop.type == "FLAT":
+        create_flat_roof(bm, faces, prop)
+    elif prop.type == "GABLE":
+        add_facemap_for_groups(FaceMap.ROOF_HANGS)
+        create_gable_roof(bm, faces, prop)
+    elif prop.type == "HIP":
+        add_facemap_for_groups(FaceMap.ROOF_HANGS)
+        create_hip_roof(bm, faces, prop)
+
+
+@map_new_faces(FaceMap.ROOF)
+def create_flat_roof(bm, faces, prop):
+    """Create a flat roof
+    """
+    ret = bmesh.ops.extrude_face_region(bm, geom=faces)
+    bmesh.ops.translate(
+        bm, vec=(0, 0, prop.thickness), verts=filter_geom(ret["geom"], BMVert)
+    )
+    top_face = filter_geom(ret["geom"], BMFace)
+    if len(top_face) > 1:
+        top_face = bmesh.ops.dissolve_faces(
+            bm, faces=top_face, use_verts=True).get("region").pop()
+    else:
+        top_face = top_face.pop()
+
+    link_faces = [f for e in top_face.edges for f in e.link_faces if f is not top_face]
+
+    bmesh.ops.inset_region(
+        bm, faces=link_faces, depth=prop.outset, use_even_offset=True
+    )
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bmesh.ops.delete(bm, geom=faces, context="FACES")
+
+    new_faces = list({f for e in top_face.edges for f in e.link_faces})
+    return bmesh.ops.dissolve_faces(bm, faces=new_faces).get("region")
+
+
+def create_gable_roof(bm, faces, prop):
+    """Create a gable roof
+    """
+    if len(faces) > 1:
+        faces = bmesh.ops.dissolve_faces(bm, faces=faces, use_verts=True).get("region")
+
+    if not is_rectangular(faces[0]):
+        popup_message("Gable Roof can only be created on rectangular faces", "Context Error")
+        return
+
+    edges = extrude_up_and_delete_faces(bm, faces, prop.height)
+    sedges = sorted(edges, key=lambda e: e.calc_length())
+    normal_edge = edge_vector(sedges[0])
+    if prop.flip_direction:
+        normal_edge = edge_vector(sedges[-1])
+
+    # -- cleanup any lone edges
+    if len(edges) > 4:
+        sverts = list({v for e in sedges for v in e.verts})
+        lone_edges = [e for v in sverts for e in v.link_edges if e not in sedges and equal(e.calc_face_angle(), 0)]
+        bmesh.ops.dissolve_edges(bm, edges=lone_edges, use_verts=True)
+        edges = validate(edges)
+
+    merge_normal = normal_edge.cross(Vector((0, 0, 1)))
+    merge_edges_along_normal(bm, edges, merge_normal)
+    roof_faces = list({f for e in edges for f in e.link_faces})
+    bmesh.ops.dissolve_degenerate(bm, dist=0.01, edges=edges)
+
+    if prop.roof_hangs:
+
+        def has_one_roof_face(e):
+            return not all([f in roof_faces for f in e.link_faces])
+
+        roof_faces = [f for f in validate(roof_faces) if f.normal.z]
+        boundary_edges = [
+            e for f in roof_faces for e in f.edges if has_one_roof_face(e)
+        ]
+        bmesh.ops.delete(bm, geom=roof_faces, context="FACES")
+
+        hang_edges = create_roof_hangs(bm, boundary_edges, prop.outset)
+        fill_roof_faces_from_hang(bm, hang_edges, prop.thickness)
+
+
+def create_hip_roof(bm, faces, prop):
+    """Create a hip roof
+    """
+    roof_hang = map_new_faces(FaceMap.ROOF_HANGS)(create_flat_roof)
+    faces = roof_hang(bm, faces, prop)
+    face = faces[-1]
+    median = face.calc_center_median()
+
+    dissolve_lone_verts(bm, face, list(face.edges))
+    original_edges = validate(face.edges)
+
+    # get verts in anti-clockwise order
+    verts = [v for v in sort_verts_by_loops(face)]
+    points = [v.co.to_tuple()[:2] for v in verts]
+
+    # compute straight skeleton
+    skeleton = skeletonize(points, [])
+    bmesh.ops.delete(bm, geom=faces, context="FACES_ONLY")
+
+    height_scale = prop.height / max([arc.height for arc in skeleton])
+
+    # -- create edges and vertices
+    skeleton_edges = create_hiproof_verts_and_edges(
+        bm, skeleton, original_edges, median, height_scale
+    )
+
+    # -- create faces
+    create_hiproof_faces(bm, original_edges, skeleton_edges)
+
+
+def is_rectangular(face):
+    """ Determine if faces form a rectangular polygon
+    Current strategies may fail, when that happens, consider strategies from
+    https://www.quora.com/How-do-you-know-if-a-polygon-is-regular
+    """
+    verts = list(face.verts)
+    loops = list({loop for v in face.verts for loop in v.link_loops if loop.face == face})
+
+    # -- strategy A (only 4 right angled verts, others colinear)
+    # no problem if the face is an ngon
+    angles = [l.calc_angle() for l in loops]
+    right_angles = [a for a in angles if round(a, 2) == 1.57]
+    other_angles = [a for a in angles if a not in right_angles and round(a, 2) == 3.14]
+    strat_b = len(right_angles) == 4 and (len(right_angles) + len(other_angles)) == len(angles)
+    if not strat_b:
+        return False
+
+    # -- strategy B (equal diagonals)
+    verts = sorted(verts, key=lambda v: (v.co.x, v.co.y))
+    _min_x, _max_x = verts[0], verts[-1]
+
+    verts = sorted(verts, key=lambda v: (v.co.y, v.co.x))
+    _min_y, _max_y = verts[0], verts[-1]
+
+    diag_a = round((_min_x.co - _max_x.co).length, 4)
+    diag_b = round((_min_y.co - _max_y.co).length, 4)
+    if not diag_a == diag_b:
+        return False
+
+    # -- strategy C (face area ~= numerical area)
+    a, b = abs(_max_x.co.x - _min_x.co.x), abs(_max_y.co.y - _min_y.co.y)
+    num_area = a * b
+    if not equal(face.calc_area(), num_area):
+        return False
+    return True
+
+
+def sort_verts_by_loops(face):
+    """ sort verts in face clockwise using loops
+    """
+    start_loop = max(face.loops, key=lambda loop: loop.vert.co.to_tuple()[:2])
+
+    verts = []
+    current_loop = start_loop
+    while len(verts) < len(face.loops):
+        verts.append(current_loop.vert)
+        current_loop = current_loop.link_loop_prev
+
+    return verts
+
+
+def vert_at_loc(loc, verts, loc_z=None):
+    """ Find all verts at loc(x,y), return the one with highest z coord
+    """
+    results = []
+    for vert in verts:
+        co = vert.co
+        if equal(co.x, loc.x) and equal(co.y, loc.y):
+            if loc_z:
+                if equal(co.z, loc_z):
+                    results.append(vert)
+            else:
+                results.append(vert)
+
+    if results:
+        return max([v for v in results], key=lambda v: v.co.z)
+    return None
+
+
+@map_new_faces(FaceMap.WALLS)
+def extrude_up_and_delete_faces(bm, faces, extrude_depth):
+    """ Extrude faces upwards and delete ones at top
+    """
+    ret = bmesh.ops.extrude_face_region(bm, geom=faces)
+    verts = filter_geom(ret["geom"], BMVert)
+    edges = filter_geom(ret["geom"], BMEdge)
+    nfaces = filter_geom(ret["geom"], BMFace)
+    bmesh.ops.translate(bm, verts=verts, vec=(0, 0, extrude_depth))
+    bmesh.ops.delete(bm, geom=faces + nfaces, context="FACES_ONLY")
+    return edges
+
+
+def merge_edges_along_normal(bm, edges, normal):
+    """ Merge verts so that they lie along the midpoint perpendicular to a normal
+    """
+    def vabs(vec):
+        return tuple(map(abs, vec.to_tuple(3)))
+
+    for edge in edges:
+        if vabs(edge_vector(edge)) == vabs(normal):
+            cen = calc_edge_median(edge)
+            for v in edge.verts:
+                v.co = cen
+    bmesh.ops.remove_doubles(bm, verts=bm.verts)
+
+
+@map_new_faces(FaceMap.ROOF_HANGS)
+def create_roof_hangs(bm, edges, size):
+    """Extrude edges outwards and slope the downward to form proper hangs
+    """
+    ret = bmesh.ops.extrude_edge_only(bm, edges=edges)
+    verts = filter_geom(ret["geom"], BMVert)
+    bmesh.ops.scale(bm, verts=verts, vec=(1 + size, 1 + size, 1),
+                    space=Matrix.Translation(-calc_verts_median(verts)))
+
+    hang_edges = list(
+        {e for v in verts for e in v.link_edges if all([v in verts for v in e.verts])}
+    )
+
+    # -- fix roof slope at bottom edges
+    min_loc_z = min([v.co.z for e in hang_edges for v in e.verts])
+    min_verts = list({v for e in hang_edges for v in e.verts if v.co.z == min_loc_z})
+    bmesh.ops.translate(bm, verts=min_verts, vec=(0, 0, -size))
+    return hang_edges
+
+
+def fill_roof_faces_from_hang(bm, edges, roof_thickness):
+    """ Use edges formed for hang to form complete roof
+    """
+    # -- extrude edges upwards
+    ret = bmesh.ops.extrude_edge_only(bm, edges=edges)
+    verts = filter_geom(ret["geom"], BMVert)
+    edges = filter_geom(ret["geom"], BMEdge)
+    bmesh.ops.translate(bm, verts=verts, vec=(0, 0, roof_thickness))
+
+    min_z = min([v.co.z for e in edges for v in e.verts])
+    valid_edges = list(filter(lambda e: calc_edge_median(e).z != min_z, edges))
+    ret = bmesh.ops.bridge_loops(bm, edges=valid_edges, use_pairs=True)
+    add_faces_to_map(bm, ret["faces"], FaceMap.ROOF)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+
+def create_hiproof_verts_and_edges(bm, skeleton, original_edges, median, height_scale):
+    """ Create the vertices and edges from output of straight skeleton
+    """
+    skeleton_edges = []
+    skeleton_verts = []
+    for arc in skeleton:
+        source = arc.source
+        vsource = vert_at_loc(source, bm.verts)
+        if not vsource:
+            source_height = [arc.height for arc in skeleton if arc.source == source]
+            ht = source_height.pop() * height_scale
+            vsource = make_vert(bm, Vector((source.x, source.y, median.z + ht)))
+            skeleton_verts.append(vsource)
+
+        for sink in arc.sinks:
+            vs = vert_at_loc(sink, bm.verts)
+            if not vs:
+                sink_height = min([arc.height for arc in skeleton if sink in arc.sinks])
+                ht = height_scale * sink_height
+                vs = make_vert(bm, Vector((sink.x, sink.y, median.z + ht)))
+            skeleton_verts.append(vs)
+
+            # create edge
+            if vs != vsource:
+                geom = bmesh.ops.contextual_create(bm, geom=[vsource, vs]).get("edges")
+                skeleton_edges.extend(geom)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+
+    skeleton_edges = validate(skeleton_edges)
+    S_verts = {v for e in skeleton_edges for v in e.verts}
+    O_verts = {v for e in original_edges for v in e.verts}
+    skeleton_verts = [v for v in skeleton_verts if v in S_verts and v not in O_verts]
+    return join_intersections_and_get_skeleton_edges(bm, skeleton_verts, skeleton_edges)
+
+
+@map_new_faces(FaceMap.ROOF)
+def create_hiproof_faces(bm, original_edges, skeleton_edges):
+    """ Create faces formed from hiproof verts and edges
+    """
+    for ed in validate(original_edges):
+        verts = ed.verts
+        linked_skeleton_edges = get_linked_edges(verts, skeleton_edges)
+        all_verts = [v for e in linked_skeleton_edges for v in e.verts]
+        opposite_verts = list(set(all_verts) - set(verts))
+
+        if len(opposite_verts) == 1:
+            # -- triangle
+            bmesh.ops.contextual_create(bm, geom=linked_skeleton_edges + [ed])
+        else:
+            edge = bm.edges.get(opposite_verts)
+            if edge:
+                # -- quad
+                geometry = linked_skeleton_edges + [ed, edge]
+                bmesh.ops.contextual_create(bm, geom=geometry)
+            else:
+                # -- polygon
+                edges = cycle_edges_form_polygon(
+                    bm, opposite_verts, skeleton_edges, linked_skeleton_edges
+                )
+                bmesh.ops.contextual_create(bm, geom=[ed] + edges)
+
+
+def make_vert(bm, location):
+    """ Create a vertex at location
+    """
+    return bmesh.ops.create_vert(bm, co=location).get("vert").pop()
+
+
+def join_intersecting_verts_and_edges(bm, edges, verts):
+    """ Find all vertices that intersect/ lie at an edge and merge
+    them to that edge
+    """
+    new_verts = []
+    for v in verts:
+        for e in edges:
+            if v in e.verts:
+                continue
+
+            v1, v2 = e.verts
+            res = mathutils.geometry.intersect_line_line_2d(v.co, v.co, v1.co, v2.co)
+            if res is not None:
+                split_vert = v1
+                split_factor = (v1.co - v.co).length / e.calc_length()
+                new_edge, new_vert = bmesh.utils.edge_split(e, split_vert, split_factor)
+                new_verts.append(new_vert)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.01)
+    return validate(new_verts)
+
+
+def get_linked_edges(verts, filter_edges):
+    """ Find all the edges linked to verts that are also in filter edges
+    """
+    linked_edges = [e for v in verts for e in v.link_edges]
+    return list(filter(lambda e: e in filter_edges, linked_edges))
+
+
+def find_closest_pair_edges(edges_a, edges_b):
+    """ Find the edges in edges_a and edges_b that are closest to each other
+    """
+
+    def length_func(pair):
+        e1, e2 = pair
+        return (calc_edge_median(e1) - calc_edge_median(e2)).length
+
+    pairs = [(e1, e2) for e1 in edges_a for e2 in edges_b]
+    return sorted(pairs, key=length_func)[0]
+
+
+def join_intersections_and_get_skeleton_edges(bm, skeleton_verts, skeleton_edges):
+    """ Join intersecting edges and verts and return all edges that are in skeleton_edges
+    """
+    new_verts = join_intersecting_verts_and_edges(bm, skeleton_edges, skeleton_verts)
+    skeleton_verts = validate(skeleton_verts) + new_verts
+    return list(set(e for v in skeleton_verts for e in v.link_edges))
+
+
+def dissolve_lone_verts(bm, face, original_edges):
+    """ Find all verts only connected to two edges and dissolve them
+    """
+    loops = {loop for v in face.verts for loop in v.link_loops if loop.face == face}
+
+    def is_parallel(loop):
+        return round(loop.calc_angle(), 2) == 3.14
+
+    parallel_verts = [loop.vert for loop in loops if is_parallel(loop)]
+    lone_edges = [
+        e for v in parallel_verts for e in v.link_edges if e not in original_edges
+    ]
+    bmesh.ops.dissolve_edges(bm, edges=lone_edges, use_verts=True)
+
+
+def cycle_edges_form_polygon(bm, verts, skeleton_edges, linked_edges):
+    """ Move in opposite directions along edges linked to verts until
+    you form a polygon
+    """
+    v1, v2 = verts
+    next_skeleton_edges = list(set(skeleton_edges) - set(linked_edges))
+    v1_edges = get_linked_edges([v1], next_skeleton_edges)
+    v2_edges = get_linked_edges([v2], next_skeleton_edges)
+    if not v1_edges or not v2_edges:
+        return linked_edges
+    pair = find_closest_pair_edges(v1_edges, v2_edges)
+
+    all_verts = [v for e in pair for v in e.verts]
+    verts = list(set(all_verts) - set(verts))
+    if len(verts) == 1:
+        return linked_edges + list(pair)
+    else:
+        edge = bm.edges.get(verts)
+        if edge:
+            return list(pair) + linked_edges + [edge]
+        else:
+            return cycle_edges_form_polygon(
+                bm, verts, skeleton_edges, linked_edges + list(pair)
+            )
+import bpy
+from .roof import Roof
+from .roof_props import RoofProperty
+
+
+class BTOOLS_OT_add_roof(bpy.types.Operator):
+    """Create roof from selected upward facing faces"""
+
+    bl_idname = "btools.add_roof"
+    bl_label = "Add Roof"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=RoofProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        return Roof.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+from bpy.props import EnumProperty, FloatProperty, BoolProperty
+
+
+class RoofProperty(bpy.types.PropertyGroup):
+    roof_items = [
+        ("FLAT", "Flat", "", 0),
+        ("GABLE", "Gable", "", 1),
+        ("HIP", "Hip", "", 2),
+    ]
+    type: EnumProperty(
+        name="Roof Type",
+        items=roof_items,
+        default="FLAT",
+        description="Type of roof to create",
+    )
+
+    thickness: FloatProperty(
+        name="Thickness",
+        min=0.01,
+        max=1000.0,
+        default=0.1,
+        description="Thickness of roof hangs",
+    )
+
+    outset: FloatProperty(
+        name="Outset",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Outset of roof hangs",
+    )
+
+    height: FloatProperty(
+        name="Height",
+        min=0.01,
+        max=1000.0,
+        default=1,
+        description="Height of entire roof",
+    )
+
+    roof_hangs: BoolProperty(
+        name="Roof Hangs", default=True, description="Whether to add roof hangs"
+    )
+
+    flip_direction: BoolProperty(
+        name="Flip Direction", default=False, description="Whether to change direction of roof axis"
+    )
+
+    def draw(self, context, layout):
+        layout.prop(self, "type", text="")
+
+        box = layout.box()
+        if self.type == "FLAT":
+            col = box.column(align=True)
+            col.prop(self, "thickness")
+            col.prop(self, "outset")
+
+        elif self.type == "GABLE":
+            row = box.row(align=True)
+            row.prop(self, "flip_direction", toggle=True)
+
+            col = box.column(align=True)
+            col.prop(self, "thickness")
+            col.prop(self, "outset")
+            col.prop(self, "height")
+
+            box.prop(self, "roof_hangs", toggle=True)
+
+        else:
+            col = box.column(align=True)
+            col.prop(self, "thickness")
+            col.prop(self, "outset")
+            col.prop(self, "height")
+import bpy
+
+from .roof import Roof
+from .roof_ops import BTOOLS_OT_add_roof
+from .roof_props import RoofProperty
+
+classes = (RoofProperty, BTOOLS_OT_add_roof)
+
+
+def register_roof():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_roof():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+
+from .roof_types import create_roof
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Roof:
+    @classmethod
+    def build(cls, context, props):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [f for f in bm.faces if f.select]
+
+        if cls.validate(bm):
+            cls.add_roof_facemaps()
+            create_roof(bm, faces, props)
+            bmesh.update_edit_mesh(me, True)
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_roof_facemaps(cls):
+        add_facemap_for_groups(FaceMap.ROOF)
+
+    @classmethod
+    def validate(cls, bm):
+        faces = [f for f in bm.faces if f.select]
+        if faces:
+            if all([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import math
+import bmesh
+from bmesh.types import BMVert
+from mathutils import Vector, Matrix
+
+import random
+from ...utils import (
+    clamp,
+    plane,
+    circle,
+    filter_geom,
+    calc_edge_median,
+    sort_edges_clockwise,
+    filter_vertical_edges,
+    filter_horizontal_edges,
+)
+
+
+def create_rectangular_floorplan(bm, prop):
+    """Create plane in provided bmesh
+    """
+    plane(bm, prop.width / 2, prop.length / 2)
+
+
+def create_circular_floorplan(bm, prop):
+    """Create circle in provided bmesh
+    """
+    circle(bm, prop.radius, prop.segments, prop.cap_tris)
+
+
+def create_composite_floorplan(bm, prop):
+    """Create a fan shape from a rectangle
+        .____.
+        |    |
+        |    |
+    .___......___.
+    |   .    .   |
+    |   .    .   |
+    .___......___.
+        |    |
+        |    |
+        .____.
+
+    """
+    plane(bm, prop.width / 2, prop.length / 2)
+    median_reference = list(bm.faces).pop().calc_center_median()
+
+    edges = sort_edges_clockwise(bm.edges)
+    extrusion_lengths = [prop.tl1, prop.tl2, prop.tl3, prop.tl4]
+    for idx, e in enumerate(edges):
+        if extrusion_lengths[idx] > 0.0:
+            res = bmesh.ops.extrude_edge_only(bm, edges=[e])
+            verts = filter_geom(res["geom"], BMVert)
+
+            direction = (calc_edge_median(e) - median_reference).normalized()
+            bmesh.ops.translate(bm, verts=verts, vec=direction * extrusion_lengths[idx])
+
+
+def create_hshaped_floorplan(bm, prop):
+    """Create H_shaped geometry from a rectangle
+
+    .___.      .___.
+    |   |      |   |
+    |   |      |   |
+    |   .______.
+    |   .      .   |
+    |   .______.   |
+    |   |      |   |
+    |   |      |   |
+    .___.      .___.
+
+    """
+    plane(bm, prop.width / 2, prop.length / 2)
+    face = list(bm.faces).pop()
+    normal = face.normal
+    median_reference = face.calc_center_median()
+
+    extrude_left_and_right_edges(bm, normal, median_reference)
+    extreme_edges = determine_clockwise_extreme_edges_for_extrusion(bm, normal)
+
+    extrusion_lengths = [prop.tl1, prop.tl2, prop.tl3, prop.tl4]
+    extrusion_widths = [prop.tw1, prop.tw2, prop.tw3, prop.tw4]
+    for idx, edge in enumerate(extreme_edges):
+        length, width = extrusion_lengths[idx], extrusion_widths[idx]
+
+        if length > 0.0:
+            res = bmesh.ops.extrude_edge_only(bm, edges=[edge])
+            verts = filter_geom(res["geom"], BMVert)
+            v = (calc_edge_median(edge) - median_reference).normalized()
+            bmesh.ops.translate(
+                bm, verts=verts, vec=Vector((0, math.copysign(1.0, v.y), 0)) * length
+            )
+
+            filter_function = min if v.x > 0 else max
+            mv1 = filter_function(list(edge.verts), key=lambda v: v.co.x)
+            mv2 = filter_function(verts, key=lambda v: v.co.x)
+            bmesh.ops.translate(
+                bm, verts=[mv1, mv2],
+                # -- subtract 1.0 from the width to offset the default width
+                vec=Vector((-math.copysign(1.0, v.x), 0, 0)) * (width - 1.0)
+            )
+
+
+def create_random_floorplan(bm, prop):
+    """Create randomly generated building floorplan
+    """
+    random.seed(prop.seed)
+    scale_x = Matrix.Scale(prop.width / 2, 4, (1, 0, 0))
+    scale_y = Matrix.Scale(prop.length / 2, 4, (0, 1, 0))
+    bmesh.ops.create_grid(
+        bm, x_segments=1, y_segments=1, size=1, matrix=scale_x @ scale_y
+    )
+
+    random_edges = random.sample(
+        list(bm.edges), random.randrange(len(bm.edges) // 3, len(bm.edges))
+    )
+    median_reference = list(bm.faces).pop().calc_center_median()
+    for edge in random_edges:
+        edge_median = calc_edge_median(edge)
+
+        middle_edge = subdivide_edge_twice_and_get_middle(bm, edge)
+        random_scale_and_translate(bm, middle_edge)
+        random_extrude(bm, middle_edge, (edge_median - median_reference).normalized())
+
+
+def extrude_left_and_right_edges(bm, normal, median_reference):
+    """Extrude the left and right edges of a plane
+    """
+    for edge in filter_vertical_edges(bm.edges, normal):
+        res = bmesh.ops.extrude_edge_only(bm, edges=[edge])
+        verts = filter_geom(res["geom"], BMVert)
+        bmesh.ops.translate(
+            bm,
+            verts=verts,
+            vec=(calc_edge_median(edge) - median_reference).normalized(),
+        )
+
+
+def determine_clockwise_extreme_edges_for_extrusion(bm, normal):
+    """top and bottom extreme edges sorted clockwise
+    """
+    all_upper_edges = filter_horizontal_edges(bm.edges, normal)
+    all_upper_edges.sort(key=lambda ed: calc_edge_median(ed).x)
+
+    upper_extreme_edges = all_upper_edges[:2] + all_upper_edges[4:]
+    return sort_edges_clockwise(upper_extreme_edges)
+
+
+def subdivide_edge_twice_and_get_middle(bm, edge):
+    """make two cuts to an edge and return middle edge
+    """
+    res = bmesh.ops.subdivide_edges(bm, edges=[edge], cuts=2)
+    new_verts = filter_geom(res["geom_inner"], BMVert)
+    return (set(new_verts[0].link_edges) & set(new_verts[1].link_edges)).pop()
+
+
+def random_scale_and_translate(bm, middle_edge):
+    """scale and translate an edge randomly along its axis
+    """
+    verts = list(middle_edge.verts)
+    length = middle_edge.calc_length()
+    median = calc_edge_median(middle_edge)
+
+    axis = Vector((1, 0, 0)) if verts[0].co.y == verts[1].co.y else Vector((0, 1, 0))
+    scale_factor = clamp(random.random() * 3, 1, 2.95)
+    bmesh.ops.scale(
+        bm, verts=verts, vec=axis * scale_factor, space=Matrix.Translation(-median)
+    )
+
+    if random.choice([0, 1]):
+        rand_offset = random.random() * length
+        bmesh.ops.translate(bm, verts=verts, vec=axis * rand_offset)
+
+
+def random_extrude(bm, middle_edge, direction):
+    """extrude an edge to a random size to make a plane
+    """
+    res = bmesh.ops.extrude_edge_only(bm, edges=[middle_edge])
+    extrude_length = (random.random() * middle_edge.calc_length()) + 1.0
+    bmesh.ops.translate(
+        bm, verts=filter_geom(res["geom"], BMVert), vec=direction * extrude_length
+    )
+import bpy
+
+from .floorplan_types import (
+    create_random_floorplan,
+    create_hshaped_floorplan,
+    create_circular_floorplan,
+    create_composite_floorplan,
+    create_rectangular_floorplan,
+)
+
+from ...utils import link_obj, bm_to_obj, bm_from_obj, create_mesh, create_object
+
+
+class Floorplan:
+    @classmethod
+    def build(cls, context, prop):
+        name = "building_" + str("{:0>3}".format(len(bpy.data.objects) + 1))
+        obj = create_object(name, create_mesh(name + "_mesh"))
+
+        bm = bm_from_obj(obj)
+        if prop.type == "RECTANGULAR":
+            create_rectangular_floorplan(bm, prop)
+
+        elif prop.type == "CIRCULAR":
+            create_circular_floorplan(bm, prop)
+
+        elif prop.type == "COMPOSITE":
+            create_composite_floorplan(bm, prop)
+
+        elif prop.type == "H-SHAPED":
+            create_hshaped_floorplan(bm, prop)
+
+        elif prop.type == "RANDOM":
+            create_random_floorplan(bm, prop)
+
+        bm_to_obj(bm, obj)
+        link_obj(obj)
+        return obj
+import bpy
+from bpy.props import EnumProperty, IntProperty, FloatProperty, BoolProperty
+from ...utils import clamp
+
+
+class FloorplanProperty(bpy.types.PropertyGroup):
+    fp_types = [
+        ("RECTANGULAR", "Rectangular", "", 0),
+        ("CIRCULAR", "Circular", "", 1),
+        ("COMPOSITE", "Composite", "", 2),
+        ("H-SHAPED", "H-Shaped", "", 3),
+        ("RANDOM", "Random", "", 4),
+    ]
+
+    type: EnumProperty(
+        items=fp_types, default="RECTANGULAR", description="Type of floorplan"
+    )
+
+    seed: IntProperty(
+        name="Seed",
+        min=0,
+        max=10000,
+        default=1,
+        description="Seed for random generation",
+    )
+
+    width: FloatProperty(
+        name="Width",
+        min=0.01,
+        max=100.0,
+        default=4,
+        description="Base Width of floorplan",
+    )
+
+    length: FloatProperty(
+        name="Length",
+        min=0.01,
+        max=100.0,
+        default=4,
+        description="Base Length of floorplan",
+    )
+
+    radius: FloatProperty(
+        name="Radius", min=0.1, max=100.0, default=1.0, description="Radius of circle"
+    )
+
+    segments: IntProperty(
+        name="Segments",
+        min=3,
+        max=100,
+        default=32,
+        description="Number of segments in the circle",
+    )
+
+    def get_segment_width(self, propname):
+        return self.get(propname, 1.0)
+
+    def set_segment_width(self, value, propname):
+        """
+        Clamp the segment width to less than default_width + base width
+        ONLY for H-Shaped floorplan
+        """
+        default_width = 1.0
+        maximum_width = default_width + self.width
+
+        # -- calculate offsets of adjacent segments
+        adjacent_prop = {
+            "tw1" : "tw2",
+            "tw2" : "tw1",
+            "tw3" : "tw4",
+            "tw4" : "tw3",
+        }.get(propname)
+        maximum_width += (default_width - self.get(adjacent_prop, 1.0))
+
+        if self.type == "H-SHAPED":
+            self[propname] = clamp(value, 0.0, maximum_width)
+        else:
+            self[propname] = value
+
+    tw1: FloatProperty(
+        name="Tail Width 1",
+        min=0.0,
+        max=100.0,
+        description="Width of floorplan segment",
+        get=lambda self : self.get_segment_width("tw1"),
+        set=lambda self, value : self.set_segment_width(value, "tw1"),
+    )
+
+    tl1: FloatProperty(
+        name="Tail Length 1",
+        min=0.0,
+        max=100.0,
+        default=1,
+        description="Length of floorplan segment",
+    )
+
+    tw2: FloatProperty(
+        name="Tail Width 2",
+        min=0.0,
+        max=100.0,
+        description="Width of floorplan segment",
+        get=lambda self : self.get_segment_width("tw2"),
+        set=lambda self, value : self.set_segment_width(value, "tw2"),
+    )
+
+    tl2: FloatProperty(
+        name="Tail Length 2",
+        min=0.0,
+        max=100.0,
+        default=1,
+        description="Length of floorplan segment",
+    )
+
+    tw3: FloatProperty(
+        name="Tail Width 3",
+        min=0.0,
+        max=100.0,
+        description="Width of floorplan segment",
+        get=lambda self : self.get_segment_width("tw3"),
+        set=lambda self, value : self.set_segment_width(value, "tw3"),
+    )
+
+    tl3: FloatProperty(
+        name="Tail Length 3",
+        min=0.0,
+        max=100.0,
+        default=1,
+        description="Length of floorplan segment",
+    )
+
+    tw4: FloatProperty(
+        name="Tail Width 4",
+        min=0.0,
+        max=100.0,
+        description="Width of floorplan segment",
+        get=lambda self : self.get_segment_width("tw4"),
+        set=lambda self, value : self.set_segment_width(value, "tw4"),
+    )
+
+    tl4: FloatProperty(
+        name="Tail Length 4",
+        min=0.0,
+        max=100.0,
+        default=1,
+        description="Length of floorplan segment",
+    )
+
+    cap_tris: BoolProperty(
+        name="Cap Triangles",
+        default=False,
+        description="Set the fill type to triangles",
+    )
+
+    def draw(self, context, layout):
+        row = layout.row()
+        row.prop(self, "type", text="")
+
+        box = layout.box()
+        if self.type == "RECTANGULAR":
+            col = box.column(align=True)
+            col.prop(self, "width")
+            col.prop(self, "length")
+
+        elif self.type == "RANDOM":
+            col = box.column(align=True)
+            col.prop(self, "seed")
+            col.prop(self, "width")
+            col.prop(self, "length")
+
+        elif self.type == "CIRCULAR":
+            col = box.column(align=True)
+            col.prop(self, "radius")
+            col.prop(self, "segments")
+
+            row = box.row()
+            row.prop(self, "cap_tris", toggle=True)
+
+        elif self.type == "COMPOSITE":
+            row = box.row(align=True)
+            row.prop(self, "width")
+            row.prop(self, "length")
+
+            col = box.column(align=True)
+            col.prop(self, "tl1", text="Fan Length 1")
+            col.prop(self, "tl2", text="Fan Length 2")
+            col.prop(self, "tl3", text="Fan Length 3")
+            col.prop(self, "tl4", text="Fan Length 4")
+
+        elif self.type == "H-SHAPED":
+            row = box.row(align=True)
+            row.prop(self, "width")
+            row.prop(self, "length")
+
+            row = box.row(align=True)
+
+            col = row.column(align=True)
+            col.prop(self, "tw1")
+            col.prop(self, "tw2")
+            col.prop(self, "tw3")
+            col.prop(self, "tw4")
+
+            col = row.column(align=True)
+            col.prop(self, "tl1")
+            col.prop(self, "tl2")
+            col.prop(self, "tl3")
+            col.prop(self, "tl4")
+import bpy
+
+from .floorplan_ops import BTOOLS_OT_add_floorplan
+from .floorplan_props import FloorplanProperty
+
+classes = (FloorplanProperty, BTOOLS_OT_add_floorplan)
+
+
+def register_floorplan():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_floorplan():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from .floorplan import Floorplan
+from .floorplan_props import FloorplanProperty
+
+
+class BTOOLS_OT_add_floorplan(bpy.types.Operator):
+    """Create a starting building floorplan"""
+
+    bl_idname = "btools.add_floorplan"
+    bl_label = "Create Floorplan"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=FloorplanProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT"
+
+    def execute(self, context):
+        Floorplan.build(context, self.props)
+        return {"FINISHED"}
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+from .floor import Floor
+from .floor_props import FloorProperty
+
+
+class BTOOLS_OT_add_floors(bpy.types.Operator):
+    """Create floors from the current edit mesh"""
+
+    bl_idname = "btools.add_floors"
+    bl_label = "Add Floors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=FloorProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        return Floor.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bmesh
+from bmesh.types import BMFace
+
+from ...utils import (
+    equal,
+    FaceMap,
+    filter_geom,
+    closest_faces,
+    add_faces_to_map,
+    extrude_face_region,
+    filter_vertical_edges,
+)
+from mathutils import Vector
+
+
+def create_floors(bm, faces, prop):
+    """Create extrusions of floor geometry from a floorplan
+    """
+    slabs, walls, roof = extrude_slabs_and_floors(bm, faces, prop)
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    add_faces_to_map(bm, slabs, FaceMap.SLABS)
+    add_faces_to_map(bm, walls, FaceMap.WALLS)
+    add_faces_to_map(bm, roof, FaceMap.ROOF)
+
+
+def extrude_slabs_and_floors(bm, faces, prop):
+    """extrude edges alternating between slab and floor heights
+    """
+    slabs = []
+    walls = []
+    normal = faces[0].normal.copy()
+
+    faces = bmesh.ops.dissolve_faces(bm, faces=faces)["region"]
+
+    # extrude vertically
+    if prop.add_slab:
+        offsets = [prop.slab_thickness, prop.floor_height] * prop.floor_count
+        for i, offset in enumerate(offsets):
+            if i == 0:
+                orig_locs = [f.calc_center_bounds() for f in faces]
+                flat_faces = get_flat_faces(faces, {})
+                flat_faces, surrounding_faces = extrude_face_region(bm, flat_faces, offset, normal)
+                dissolve_flat_edges(bm, surrounding_faces)
+                surrounding_faces = filter_geom(bmesh.ops.region_extend(bm, geom=flat_faces, use_faces=True)["geom"], BMFace)
+                faces = closest_faces(flat_faces, [l+Vector((0., 0., offset)) for l in orig_locs])
+            else:
+                faces, surrounding_faces = extrude_face_region(bm, faces, offset, normal)
+            if i % 2:
+                walls += surrounding_faces
+            else:
+                slabs += surrounding_faces
+
+        # extrude slabs horizontally
+        slabs += bmesh.ops.inset_region(
+            bm, faces=slabs, depth=prop.slab_outset, use_even_offset=True, use_boundary=True)["faces"]
+
+    else:
+        offsets = [prop.floor_height] * prop.floor_count
+        for i, offset in enumerate(offsets):
+            faces, surrounding_faces = extrude_face_region(bm, faces, offset, normal)
+            if i == 0:
+                dissolve_flat_edges(bm, surrounding_faces)
+                surrounding_faces = filter_geom(bmesh.ops.region_extend(bm, geom=faces, use_faces=True)["geom"], BMFace)
+            walls += surrounding_faces
+
+    return slabs, walls, faces
+
+
+def dissolve_flat_edges(bm, faces):
+    flat_edges = list({e for f in faces for e in filter_vertical_edges(f.edges, f.normal) if len(e.link_faces) > 1 and equal(e.calc_face_angle(), 0)})
+    bmesh.ops.dissolve_edges(bm, edges=flat_edges, use_verts=True)
+
+
+def get_flat_faces(faces, visited):
+    flat_edges = list({e for f in faces for e in f.edges if len(e.link_faces) > 1 and equal(e.calc_face_angle(), 0)})
+    flat_faces = []
+    for e in flat_edges:
+        for f in e.link_faces:
+            if not visited.get(f, False):
+                visited[f] = True
+                flat_faces += get_flat_faces([f], visited)
+    return list(set(faces + flat_faces))
+import bpy
+from bpy.props import IntProperty, FloatProperty, BoolProperty
+
+
+class FloorProperty(bpy.types.PropertyGroup):
+    floor_count: IntProperty(
+        name="Floor Count", min=1, max=1000, default=1, description="Number of floors"
+    )
+
+    floor_height: FloatProperty(
+        name="Floor Height",
+        min=0.01,
+        max=1000.0,
+        default=2.0,
+        description="Height of each floor",
+    )
+
+    add_slab: BoolProperty(
+        name="Add Slab",
+        default=True,
+        description="Add slab between each floor",
+    )
+
+    slab_thickness: FloatProperty(
+        name="Slab Thickness",
+        min=0.01,
+        max=1000.0,
+        default=0.2,
+        description="Thickness of each slab",
+    )
+
+    slab_outset: FloatProperty(
+        name="Slab Outset",
+        min=0.0,
+        max=10.0,
+        default=0.1,
+        description="Outset of each slab",
+    )
+
+    def draw(self, context, layout):
+        box = layout.box()
+
+        col = box.column(align=True)
+        col.prop(self, "floor_count")
+        col.prop(self, "floor_height")
+
+        col = box.column(align=True)
+        col.prop(self, "add_slab")
+        if self.add_slab:
+            col.prop(self, "slab_thickness")
+            col.prop(self, "slab_outset")
+import bmesh
+from .floor_types import create_floors
+
+from ...utils import (
+    select,
+    FaceMap,
+    get_edit_mesh,
+    add_facemap_for_groups,
+    verify_facemaps_for_object,
+)
+
+
+class Floor:
+    @classmethod
+    def build(cls, context, prop):
+        verify_facemaps_for_object(context.object)
+        context.object.tracked_properties.slab_outset = prop.slab_outset
+
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+
+        if cls.validate(bm):
+            cls.add_floor_facemaps()
+            selected_faces = [f for f in bm.faces if f.select]
+            if selected_faces:
+                create_floors(bm, selected_faces, prop)
+                select(bm.faces, False)
+            else:
+                all_faces = [f for f in bm.faces]
+                create_floors(bm, all_faces, prop)
+            bmesh.update_edit_mesh(me, True)
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_floor_facemaps(cls):
+        groups = FaceMap.SLABS, FaceMap.WALLS, FaceMap.ROOF
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, bm):
+        if any([f for f in bm.faces if f.select]):
+            selection = [f for f in bm.faces if f.select]
+            if len({round(v.co.z, 4) for f in selection for v in f.verts}) == 1:
+                return True
+        elif len({round(v.co.z, 4) for v in bm.verts}) == 1:
+            return True
+        return False
+import bpy
+
+from .floor_ops import BTOOLS_OT_add_floors
+from .floor_props import FloorProperty
+
+classes = (FloorProperty, BTOOLS_OT_add_floors)
+
+
+def register_floor():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_floor():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import math
+import bmesh
+
+from mathutils import Vector, Quaternion
+from bmesh.types import BMFace, BMEdge
+
+from ...utils import (
+    FaceMap,
+    valid_ngon,
+    filter_geom,
+    popup_message,
+    add_faces_to_map,
+    create_face,
+    local_xyz,
+    subdivide_face_vertically,
+    subdivide_edges,
+    sort_faces,
+    sort_edges,
+    sort_verts,
+    filter_parallel_edges,
+    vec_equal,
+    extrude_face,
+)
+
+from ..railing.railing import create_railing
+
+
+def create_stairs(bm, faces, prop):
+    """Extrude steps from selected faces
+    """
+
+    for f in faces:
+        f.select = False
+        if not valid_ngon(f):
+            popup_message("Stairs creation not supported for non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        f = create_stairs_split(bm, f, prop)
+        add_faces_to_map(bm, [f], FaceMap.STAIRS)
+
+        normal = f.normal.copy()
+        top_faces = create_steps(bm, f, prop)
+
+        if prop.has_railing:
+            add_railing_to_stairs(bm, top_faces, normal, prop)
+
+    return True
+
+
+def create_steps(bm, face, prop):
+    """ Create stair steps with landing"""
+    if prop.landing:
+        step_widths = [prop.landing_width] + [prop.step_width] * prop.step_count
+    else:
+        step_widths = [prop.step_width] * prop.step_count
+
+    if prop.bottom == "FILLED":
+        return create_filled_steps(bm, face, step_widths, prop.step_height)
+    elif prop.bottom == "BLOCKED":
+        return create_blocked_steps(bm, face, step_widths, prop.step_height)
+    elif prop.bottom == "SLOPE":
+        return create_slope_steps(bm, face, step_widths, prop.step_height)
+
+
+def create_filled_steps(bm, face, step_widths, step_height):
+    """ Create filled stair steps with landing"""
+
+    normal = face.normal.copy()
+    top_faces = []
+
+    # create steps
+    front_face = face
+    for i, step_width in enumerate(step_widths):
+        if i == 0:
+            front_face, surrounding_faces = extrude_face(bm, front_face, step_width)
+            top_faces.append([f for f in surrounding_faces if vec_equal(f.normal, Vector((0., 0., 1.)))][0])
+        else:
+            bottom_face = list({f for e in front_face.edges for f in e.link_faces if vec_equal(f.normal, Vector((0., 0., -1.)))})[0]
+            top_face, front_face, _ = extrude_step(bm, bottom_face, normal, step_height, step_width)
+            top_faces.append(top_face)
+
+    return top_faces
+
+
+def create_blocked_steps(bm, face, step_widths, step_height):
+    """ Create blocked steps with landing"""
+
+    normal = face.normal.copy()
+    top_faces = []
+
+    # create steps
+    front_face = face
+    for i, step_width in enumerate(step_widths):
+        if i == 0:
+            front_face, surrounding_faces = extrude_face(bm, front_face, step_width)
+            top_faces.append([f for f in surrounding_faces if vec_equal(f.normal, Vector((0., 0., 1.)))][0])
+        else:
+            bottom_face = list({f for e in front_face.edges for f in e.link_faces if vec_equal(f.normal, Vector((0., 0., -1.)))})[0]
+            edges = filter_parallel_edges(bottom_face.edges, normal)
+            widths = [edges[0].calc_length() - step_height, step_height]
+
+            inner_edges = subdivide_edges(bm, edges, normal, widths=widths)
+            bottom_face = sort_faces(list({f for e in inner_edges for f in e.link_faces}), normal)[1]
+
+            top_face, front_face, _ = extrude_step(bm, bottom_face, normal, step_height, step_width)
+            top_faces.append(top_face)
+
+    return top_faces
+
+
+def create_slope_steps(bm, face, step_widths, step_height):
+    """ Create slope steps with landing"""
+
+    normal = face.normal.copy()
+    top_faces = []
+
+    # create steps
+    front_face = face
+    for i, step_width in enumerate(step_widths):
+        if i == 0:
+            front_face, surrounding_faces = extrude_face(bm, front_face, step_width)
+            top_faces.append([f for f in surrounding_faces if vec_equal(f.normal, Vector((0., 0., 1.)))][0])
+        else:
+            bottom_face = list({f for e in front_face.edges for f in e.link_faces if vec_equal(f.normal, Vector((0., 0., -1.)))})[0]
+
+            e1 = sort_edges(bottom_face.edges, normal)[0]
+            edges = filter_parallel_edges(bottom_face.edges, normal)
+            widths = [edges[0].calc_length() - step_height, step_height]
+            inner_edges = subdivide_edges(bm, edges, normal, widths=widths)
+            bottom_face = sort_faces(list({f for e in inner_edges for f in e.link_faces}), normal)[1]
+            e2 = sort_edges(bottom_face.edges, normal)[0]
+
+            top_face, front_face, _ = extrude_step(bm, bottom_face, normal, step_height, step_width)
+            top_faces.append(top_face)
+
+            bmesh.ops.translate(bm, verts=e2.verts, vec=-2*normal*step_width/2)
+            bmesh.ops.remove_doubles(bm, verts=list(e1.verts)+list(e2.verts), dist=0.001)
+
+    return top_faces
+
+
+def extrude_step(bm, face, normal, step_height, step_width):
+    """ Extrude a stair step from previous bottom face
+    """
+    # extrude down
+    n = face.normal.copy()
+    face = bmesh.ops.extrude_discrete_faces(bm, faces=[face]).get("faces")[0]
+    bmesh.ops.translate(bm, vec=n*step_height, verts=face.verts)
+
+    # extrude front
+    front_face = list({f for e in face.edges for f in e.link_faces if vec_equal(f.normal, normal)})[0]
+    front_face, surrounding_faces = extrude_face(bm, front_face, step_width)
+    flat_edges = list({e for f in surrounding_faces for e in f.edges if e.calc_face_angle() < 0.001 and e.calc_face_angle() > -0.001})
+    bmesh.ops.dissolve_edges(bm, edges=flat_edges, use_verts=True)
+    top_face = list({f for e in front_face.edges for f in e.link_faces if vec_equal(f.normal, Vector((0., 0., 1.)))})[0]
+    bottom_face = list({f for e in front_face.edges for f in e.link_faces if vec_equal(f.normal, Vector((0., 0., -1.)))})[0]
+
+    return top_face, front_face, bottom_face
+
+
+def subdivide_next_step(bm, ret_face, remaining, step_height):
+    """ cut the next face step height
+    """
+    return subdivide_face_vertically(bm, ret_face, widths=[remaining*step_height, step_height])[0]
+
+
+def create_stairs_split(bm, face, prop):
+    """Use properties to create face
+    """
+    xyz = local_xyz(face)
+    size = Vector((prop.size_offset.size.x, prop.step_height))
+    f = create_face(bm, size, prop.size_offset.offset, xyz)
+    bmesh.ops.translate(
+        bm, verts=f.verts, vec=face.calc_center_bounds() - face.normal*prop.depth_offset
+    )
+    if not vec_equal(f.normal, face.normal):
+        bmesh.ops.reverse_faces(bm, faces=[f])
+    return f
+
+
+def add_railing_to_stairs(bm, top_faces, normal, prop):
+    steps = sort_faces(top_faces, normal)
+    first_step = steps[0]
+    last_step = steps[-1]
+
+    # create railing initial edges
+    if prop.landing:
+        v1, v2 = railing_verts(bm, sort_verts(first_step.verts, normal)[:2], normal, prop.rail.offset, prop.rail.corner_post_width/2)
+        v3, v4 = railing_verts(bm, sort_verts(first_step.verts, normal)[-2:], normal, prop.rail.offset, -prop.step_width/2)
+        v5, v6 = railing_verts(bm, sort_verts(last_step.verts, normal)[:2], normal, prop.rail.offset, prop.step_width/2)
+        e1 = bmesh.ops.contextual_create(bm, geom=(v1, v3))["edges"][0]
+        e2 = bmesh.ops.contextual_create(bm, geom=[v3, v5])["edges"][0]
+        e3 = bmesh.ops.contextual_create(bm, geom=[v2, v4])["edges"][0]
+        e4 = bmesh.ops.contextual_create(bm, geom=[v4, v6])["edges"][0]
+        railing_edges = [e1, e2, e3, e4]
+    else:
+        v1, v2 = railing_verts(bm, sort_verts(first_step.verts, normal)[:2], normal, prop.rail.offset, prop.step_width/2)
+        v3, v4 = railing_verts(bm, sort_verts(last_step.verts, normal)[:2], normal, prop.rail.offset, prop.step_width/2)
+        e1 = bmesh.ops.contextual_create(bm, geom=(v1, v3))["edges"][0]
+        e2 = bmesh.ops.contextual_create(bm, geom=[v2, v4])["edges"][0]
+        railing_edges = [e1, e2]
+
+    # extrude edges
+    ret = bmesh.ops.extrude_edge_only(bm, edges=railing_edges)
+    top_edges = filter_geom(ret["geom"], BMEdge)
+    top_verts = list({v for e in top_edges for v in e.verts})
+    bmesh.ops.translate(bm, verts=top_verts, vec=Vector((0., 0., 1.))*prop.rail.corner_post_height)
+    railing_faces = filter_geom(ret["geom"], BMFace)
+
+    create_railing(bm, railing_faces, prop.rail, normal)
+
+
+def railing_verts(bm, verts, normal, offset, depth):
+    tangent = normal.copy()
+    tangent.rotate(Quaternion(Vector((0., 0., 1.)), math.pi/2).to_euler())
+    verts = sort_verts(verts, tangent)
+    co1 = verts[0].co + depth * normal
+    co2 = verts[1].co + depth * normal
+    v1 = bmesh.ops.create_vert(bm, co=co1)["vert"][0]
+    v2 = bmesh.ops.create_vert(bm, co=co2)["vert"][0]
+    bmesh.ops.translate(bm, verts=[v1], vec=tangent*offset)
+    bmesh.ops.translate(bm, verts=[v2], vec=-tangent*offset)
+    return v1, v2
+import bpy
+from .stairs import Stairs
+from .stairs_props import StairsProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_stairs(bpy.types.Operator):
+    """Create stairs from selected faces"""
+
+    bl_idname = "btools.add_stairs"
+    bl_label = "Add Stairs"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=StairsProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Stairs.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+
+from .stairs import Stairs
+from .stairs_ops import BTOOLS_OT_add_stairs
+from .stairs_props import StairsProperty
+
+classes = (StairsProperty, BTOOLS_OT_add_stairs)
+
+
+def register_stairs():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_stairs():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from bpy.props import (
+    IntProperty,
+    BoolProperty,
+    FloatProperty,
+    PointerProperty,
+    EnumProperty,
+)
+
+from ..railing.railing_props import RailProperty
+from ..generic import SizeOffsetProperty
+
+
+class StairsProperty(bpy.types.PropertyGroup):
+    redo: BoolProperty()
+
+    depth_offset: FloatProperty(
+        name="Depth Offset",
+        min=0.0,
+        max=100.0,
+        default=0.0,
+        description="Depth offset of stairs",
+    )
+
+    step_count: IntProperty(
+        name="Step Count", min=1, max=100, default=3, description="Number of steps"
+    )
+
+    step_width: FloatProperty(
+        name="Step Width",
+        min=0.01,
+        max=100.0,
+        default=0.2,
+        description="Width of each step",
+    )
+
+    step_height: FloatProperty(
+        name="Step Height",
+        min=0.01,
+        max=100.0,
+        default=0.12,
+        description="Height of each step",
+    )
+
+    landing_width: FloatProperty(
+        name="Landing Width",
+        min=0.01,
+        max=100.0,
+        default=1.0,
+        description="Width of each stairs landing",
+    )
+
+    landing: BoolProperty(
+        name="Has Landing", default=True, description="Whether the stairs have a landing"
+    )
+
+    bottom_types = [
+        ("FILLED", "Filled", "", 0),
+        ("SLOPE", "Slope", "", 2),
+        ("BLOCKED", "Blocked", "", 1),
+    ]
+
+    bottom: EnumProperty(
+        name="Bottom Type",
+        items=bottom_types,
+        default="FILLED",
+        description="Bottom type of stairs",
+    )
+
+    has_railing: BoolProperty(
+        name="Add Railing", default=True, description="Whether the stairs have railing"
+    )
+
+    rail: PointerProperty(type=RailProperty)
+
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init(
+            (self['wall_dimensions'][0], 0.0),
+            default_size=(1.0, 0.0), default_offset=(0.0, 0.0),
+            restricted=False,
+        )
+        self.rail.init(self.step_width, self.step_count)
+
+    def draw(self, context, layout):
+        self.size_offset.draw(context, layout)
+
+        col = layout.column(align=True)
+        col.prop(self, "depth_offset")
+
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "step_count")
+        row = col.row(align=True)
+        row.prop(self, "step_height")
+        row.prop(self, "step_width")
+
+        col = layout.column()
+        col.prop(self, "landing")
+        if self.landing:
+            box = layout.box()
+            col = box.column()
+            col.prop(self, "landing_width")
+        
+        col = layout.column()
+        col.prop_menu_enum(self, "bottom", text="Bottom Type")
+
+        layout.prop(self, "has_railing")
+        if self.has_railing:
+            box = layout.box()
+            self.rail.draw(context, box)
+import bmesh
+
+from .stairs_types import create_stairs
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Stairs:
+    @classmethod
+    def build(cls, context, prop):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [f for f in bm.faces if f.select]
+    
+        if cls.validate(faces):
+            cls.add_stairs_facemaps()
+            if create_stairs(bm, faces, prop):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_stairs_facemaps(cls):
+        add_facemap_for_groups(FaceMap.STAIRS)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+from bpy.props import FloatProperty, PointerProperty, EnumProperty, BoolProperty
+
+from ..fill import FillBars, FillLouver, FillGlassPanes
+from ..generic import ArchProperty, SizeOffsetProperty, CountProperty
+
+
+class WindowProperty(bpy.types.PropertyGroup):
+    frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Thickness of window Frame",
+    )
+
+    frame_depth: FloatProperty(
+        name="Frame Depth",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        description="Depth of window Frame",
+    )
+
+    window_depth: FloatProperty(
+        name="Window Depth",
+        min=0.0,
+        max=1.0,
+        default=0.05,
+        description="Depth of window",
+    )
+
+    add_arch: BoolProperty(
+        name="Add Arch",
+        default=False,
+        description="Add arch over door/window",
+    )
+
+    count: CountProperty
+    arch: PointerProperty(type=ArchProperty)
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    fill_items = [
+        ("NONE", "None", "", 0),
+        ("BAR", "Bar", "", 1),
+        ("LOUVER", "Louver", "", 2),
+        ("GLASS_PANES", "Glass_Panes", "", 3),
+    ]
+    fill_type: EnumProperty(
+        name="Fill Type",
+        items=fill_items,
+        default="NONE",
+        description="Type of fill for window",
+    )
+
+    bar_fill: PointerProperty(type=FillBars)
+    louver_fill: PointerProperty(type=FillLouver)
+    glass_fill: PointerProperty(type=FillGlassPanes)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0]/self.count, self['wall_dimensions'][1]), default_size=(1.0, 1.0), default_offset=(0.0, 0.0))
+        self.arch.init(wall_dimensions[1]/2 - self.size_offset.offset.y - self.size_offset.size.y/2)
+
+    def draw(self, context, layout):
+        box = layout.box()
+        self.size_offset.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "frame_depth")
+        row.prop(self, "frame_thickness")
+        row = col.row(align=True)
+        row.prop(self, "window_depth")
+
+        col = box.column(align=True)
+        col.prop(self, "count")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "add_arch")
+        if self.add_arch:
+            self.arch.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        prop_name = "Fill Type" if self.fill_type == "NONE" else self.fill_type.title().replace('_', ' ')
+        col.prop_menu_enum(self, "fill_type", text=prop_name)
+
+        # -- draw fill types
+        fill_map = {
+            "BAR": self.bar_fill,
+            "LOUVER": self.louver_fill,
+            "GLASS_PANES": self.glass_fill,
+        }
+        fill = fill_map.get(self.fill_type)
+        if fill:
+            fill.draw(box)
+import bmesh
+
+from ..generic import clamp_count
+from ..frame import add_frame_depth
+from ..fill import fill_bar, fill_louver, fill_glass_panes, FillUser
+
+from ..arch import (
+    fill_arch,
+    create_arch,
+    add_arch_depth,
+)
+from ...utils import (
+    FaceMap,
+    validate,
+    local_xyz,
+    valid_ngon,
+    popup_message,
+    get_top_edges,
+    get_top_faces,
+    map_new_faces,
+    get_bottom_faces,
+    add_faces_to_map,
+    extrude_face_region,
+    calc_face_dimensions,
+    add_facemap_for_groups,
+    subdivide_face_vertically,
+    subdivide_face_horizontally,
+)
+
+
+def create_window(bm, faces, prop):
+    """Generate a window
+    """
+    for face in faces:
+        if not valid_ngon(face):
+            popup_message("Window creation not supported for non-rectangular n-gon", "Ngon Error")
+            return False
+
+        face.select = False
+        clamp_count(calc_face_dimensions(face)[0], prop.frame_thickness * 2, prop)
+        array_faces = subdivide_face_horizontally(bm, face, widths=[prop.size_offset.size.x]*prop.count)
+        for aface in array_faces:
+            face = create_window_split(bm, aface, prop.size_offset.size, prop.size_offset.offset)
+            window, arch = create_window_frame(bm, face, prop)
+            fill_window_face(bm, window, prop)
+            if prop.add_arch:
+                fill_arch(bm, arch, prop)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    return True
+
+
+@map_new_faces(FaceMap.WALLS)
+def create_window_split(bm, face, size, offset):
+    """Use properties from SplitOffset to subdivide face into regular quads
+    """
+    wall_w, wall_h = calc_face_dimensions(face)
+    # horizontal split
+    h_widths = [wall_w/2 + offset.x - size.x/2, size.x, wall_w/2 - offset.x - size.x/2]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical split
+    v_width = [wall_h/2 + offset.y - size.y/2, size.y, wall_h/2 - offset.y - size.y/2]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_width)
+
+    return v_faces[1]
+
+
+def create_window_frame(bm, face, prop):
+    """Create extrude and inset around a face to make window frame
+    """
+
+    normal = face.normal.copy()
+
+    window_face, frame_faces = make_window_inset(bm, face, prop.size_offset.size, prop.frame_thickness)
+    arch_face = None
+
+    # create arch
+    if prop.add_arch:
+        frame_faces.remove(get_top_faces(frame_faces).pop()) # remove top face from frame_faces
+        top_edges = get_top_edges({e for f in get_bottom_faces(frame_faces, n=3)[1:] for e in f.edges}, n=2)
+        arch_face, arch_frame_faces = create_arch(bm, top_edges, frame_faces, prop.arch, prop.frame_thickness, local_xyz(face))
+        frame_faces += arch_frame_faces
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    # add depths
+    if prop.add_arch:
+        _, [window_face], [arch_face], frame_faces = add_frame_depth(bm, [], [window_face], [arch_face], frame_faces, prop.frame_depth, normal)
+        arch_face, new_frame_faces = add_arch_depth(bm, arch_face, prop.arch.depth, normal)
+        frame_faces += new_frame_faces
+    else:
+        _, [window_face], _, frame_faces = add_frame_depth(bm, [], [window_face], [], frame_faces, prop.frame_depth, normal)
+
+    window_face, new_frame_faces = add_window_depth(bm, window_face, prop.window_depth, normal)
+    frame_faces += new_frame_faces
+
+    # add face maps
+    add_faces_to_map(bm, [window_face], FaceMap.WINDOW)
+    add_faces_to_map(bm, validate(frame_faces), FaceMap.FRAME)
+    if prop.add_arch:
+        add_faces_to_map(bm, [arch_face], FaceMap.WINDOW)
+
+    return window_face, arch_face
+
+
+def add_window_depth(bm, window, depth, normal):
+    if depth > 0.0:
+        window_faces, frame_faces = extrude_face_region(bm, [window], -depth, normal)
+        return window_faces[0], frame_faces
+    else:
+        return window, []
+
+
+def make_window_inset(bm, face, size, frame_thickness):
+    """ Make two horizontal cuts and two vertical cuts
+    """
+    window_width = size.x - frame_thickness * 2
+    window_height = size.y - frame_thickness * 2
+    # horizontal cuts
+    h_widths = [frame_thickness, window_width, frame_thickness]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical cuts
+    v_widths = [frame_thickness, window_height, frame_thickness]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_widths)
+    return v_faces[1], h_faces[::2] + v_faces[::2]
+
+
+def fill_window_face(bm, face, prop):
+    """Create extra elements on face
+    """
+    if prop.fill_type == "GLASS_PANES":
+        add_facemap_for_groups(FaceMap.WINDOW_PANES)
+        fill_glass_panes(bm, face, prop.glass_fill, user=FillUser.WINDOW)
+    elif prop.fill_type == "BAR":
+        add_facemap_for_groups(FaceMap.WINDOW_BARS)
+        fill_bar(bm, face, prop.bar_fill)
+    elif prop.fill_type == "LOUVER":
+        add_facemap_for_groups(FaceMap.WINDOW_LOUVERS)
+        fill_louver(bm, face, prop.louver_fill, user=FillUser.WINDOW)
+import bpy
+
+from .window_ops import BTOOLS_OT_add_window
+from .window_props import WindowProperty
+
+classes = (WindowProperty, BTOOLS_OT_add_window)
+
+
+def register_window():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_window():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+from .window_types import create_window
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Window:
+    @classmethod
+    def build(cls, context, prop):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_window_facemaps()
+            if create_window(bm, faces, prop):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_window_facemaps(cls):
+        groups = FaceMap.WINDOW, FaceMap.FRAME
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+from .window import Window
+from .window_props import WindowProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_window(bpy.types.Operator):
+    """Create window from selected faces"""
+
+    bl_idname = "btools.add_window"
+    bl_label = "Add Window"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=WindowProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Window.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+from .fill_props import FillBars, FillPanel, FillLouver, FillGlassPanes
+from .fill_types import fill_bar, fill_panel, fill_louver, fill_glass_panes, FillUser
+
+classes = (FillBars, FillPanel, FillLouver, FillGlassPanes)
+
+
+def register_fill():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_fill():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from bpy.props import IntProperty, FloatProperty
+
+
+class FillPanel(bpy.types.PropertyGroup):
+
+    panel_count_x: IntProperty(
+        name="Horizontal Panels",
+        min=0,
+        max=100,
+        default=1,
+        description="Number of horizontal panels",
+    )
+
+    panel_count_y: IntProperty(
+        name="Vertical Panels",
+        min=0,
+        max=100,
+        default=1,
+        description="Number of vertical panels",
+    )
+
+    panel_border_size: FloatProperty(
+        name="Panel Border",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Border for panels",
+    )
+
+    panel_margin: FloatProperty(
+        name="Panel Margin",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Margins of each panel",
+    )
+
+    panel_depth: FloatProperty(
+        name="Panel Depth",
+        min=0.01,
+        max=100.0,
+        default=0.01,
+        step=1,
+        description="Depth of panels",
+    )
+
+    def draw(self, layout):
+        box = layout.box()
+
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "panel_count_x")
+        row.prop(self, "panel_count_y")
+        col.prop(self, "panel_border_size")
+        col.prop(self, "panel_margin")
+        col.prop(self, "panel_depth")
+
+
+class FillGlassPanes(bpy.types.PropertyGroup):
+    pane_count_x: IntProperty(
+        name="Horizontal glass panes",
+        min=0,
+        max=10,
+        default=1,
+        description="Number of horizontal glass panes",
+    )
+
+    pane_count_y: IntProperty(
+        name="Vertical glass panes",
+        min=0,
+        max=10,
+        default=1,
+        description="Number of vertical glass panes",
+    )
+
+    pane_margin: FloatProperty(
+        name="Glass Pane Margin",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Margin of glass pane frames",
+    )
+
+    pane_depth: FloatProperty(
+        name="Glass Pane Depth",
+        min=0.0,
+        max=0.1,
+        default=0.01,
+        step=0.1,
+        description="Depth of glass panes",
+    )
+
+    def draw(self, box):
+
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "pane_count_x")
+        row.prop(self, "pane_count_y")
+        col.prop(self, "pane_margin", slider=True)
+        col.prop(self, "pane_depth", slider=True)
+
+
+class FillLouver(bpy.types.PropertyGroup):
+    louver_count: IntProperty(
+        name="Louver Count",
+        min=0,
+        max=1000,
+        default=10,
+        description="Number of louvers on to create face",
+    )
+
+    louver_margin: FloatProperty(
+        name="Louver Margin",
+        min=0.0,
+        max=100.0,
+        default=0.1,
+        step=1,
+        description="Offset of louvers from face border",
+    )
+
+    louver_depth: FloatProperty(
+        name="Louver Depth",
+        min=0.01,
+        max=100.0,
+        default=0.05,
+        step=1,
+        description="Depth of each louver",
+    )
+
+    louver_border: FloatProperty(
+        name="Louver Border",
+        min=0.0,
+        max=1.0,
+        default=0.01,
+        step=1,
+        description="Distance between louvers",
+    )
+
+    def draw(self, box):
+
+        box.prop(self, "louver_margin")
+
+        col = box.column(align=True)
+        col.prop(self, "louver_count")
+        col.prop(self, "louver_depth")
+        col.prop(self, "louver_border")
+
+
+class FillBars(bpy.types.PropertyGroup):
+    bar_count_x: IntProperty(
+        name="Horizontal Bars",
+        min=0,
+        max=100,
+        default=1,
+        description="Number of horizontal bars",
+    )
+
+    bar_count_y: IntProperty(
+        name="Vertical Bars",
+        min=0,
+        max=100,
+        default=1,
+        description="Number of vertical bars",
+    )
+
+    bar_width: FloatProperty(
+        name="Bar Width", min=0.01, max=100.0, default=0.1, description="Width of bars"
+    )
+
+    bar_depth: FloatProperty(
+        name="Bar Depth",
+        min=0.01,
+        max=100.0,
+        default=0.1,
+        step=1,
+        description="Depth of bars",
+    )
+
+    def draw(self, box):
+
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "bar_count_x")
+        row.prop(self, "bar_count_y")
+        col.prop(self, "bar_width")
+        col.prop(self, "bar_depth")
+import bmesh
+from enum import Enum, auto
+from mathutils import Vector, Matrix
+from bmesh.types import BMEdge, BMVert
+from ...utils import (
+    FaceMap,
+    validate,
+    filter_geom,
+    map_new_faces,
+    add_faces_to_map,
+    calc_edge_median,
+    calc_face_dimensions,
+    filter_vertical_edges,
+    filter_horizontal_edges,
+)
+
+
+class FillUser(Enum):
+    DOOR = auto()
+    WINDOW = auto()
+
+
+@map_new_faces(FaceMap.FRAME, skip=FaceMap.DOOR_PANELS)
+def fill_panel(bm, face, prop):
+    """Create panels on face
+    """
+    if prop.panel_count_x + prop.panel_count_y == 0:
+        return
+
+    bmesh.ops.inset_individual(bm, faces=[face], thickness=prop.panel_border_size)
+    quads = subdivide_face_into_quads(bm, face, prop.panel_count_x, prop.panel_count_y)
+    bmesh.ops.inset_individual(bm, faces=quads, thickness=prop.panel_margin / 2)
+    bmesh.ops.translate(
+        bm,
+        verts=list({v for f in quads for v in f.verts}),
+        vec=face.normal * prop.panel_depth,
+    )
+    add_faces_to_map(bm, quads, FaceMap.DOOR_PANELS)
+
+
+def fill_glass_panes(bm, face, prop, user=FillUser.DOOR):
+    """Create glass panes on face
+    """
+    if prop.pane_count_x + prop.pane_count_y == 0:
+        return
+
+    userframe = FaceMap.DOOR_PANES if user == FillUser.DOOR else FaceMap.WINDOW_PANES
+    bmesh.ops.inset_individual(bm, faces=[face], thickness=0.0001) # to isolate the working quad and not leave adjacent face as n-gon
+    quads = subdivide_face_into_quads(bm, face, prop.pane_count_x, prop.pane_count_y)
+
+    inset = map_new_faces(userframe)(bmesh.ops.inset_individual)
+    inset(bm, faces=quads, thickness=prop.pane_margin, depth=-prop.pane_depth)
+
+    usergroup = FaceMap.DOOR if user == FillUser.DOOR else FaceMap.WINDOW
+    add_faces_to_map(bm, quads, usergroup)
+
+
+@map_new_faces(FaceMap.WINDOW_BARS)
+def fill_bar(bm, face, prop):
+    """Create horizontal and vertical bars along a face
+    """
+    try:
+        width, height = calc_face_dimensions(face)
+    except IndexError:
+        # -- face is too small / has no width or height after sizeoffset prop adjusted
+        return
+    face_center = face.calc_center_median()
+
+    # -- horizontal
+    offset = height / (prop.bar_count_x + 1)
+    for i in range(prop.bar_count_x):
+        scale = (1, 1, prop.bar_width / height)
+        position = Vector((face.normal * prop.bar_depth / 2)) + Vector(
+            (0, 0, -height / 2 + (i + 1) * offset)
+        )
+        depth = -face.normal * prop.bar_depth / 2
+        create_bar_from_face(bm, face, face_center, position, scale, depth)
+
+    # -- vertical
+    eps = 0.015
+    offset = width / (prop.bar_count_y + 1)
+    for i in range(prop.bar_count_y):
+        scale = (prop.bar_width / width, prop.bar_width / width, 1)
+        perp = face.normal.cross(Vector((0, 0, 1)))
+        position = Vector((face.normal * ((prop.bar_depth / 2) - eps))) + perp * (
+            -width / 2 + ((i + 1) * offset)
+        )
+        depth = -face.normal * ((prop.bar_depth / 2) - eps)
+        create_bar_from_face(bm, face, face_center, position, scale, depth, True)
+
+
+def fill_louver(bm, face, prop, user=FillUser.DOOR):
+    """Create louvers from face
+    """
+    normal = face.normal.copy()
+    if prop.louver_margin:
+        inset = map_new_faces(FaceMap.FRAME)(bmesh.ops.inset_individual)
+        inset(bm, faces=[face], thickness=prop.louver_margin)
+
+    segments = double_and_make_even(prop.louver_count)
+    faces = subdivide_face_into_vertical_segments(bm, face, segments)
+    faces.sort(key=lambda f: f.calc_center_median().z)
+    louver_faces = faces[1::2]
+
+    # -- scale to border
+    for face in louver_faces:
+        bmesh.ops.scale(
+            bm,
+            vec=(1, 1, 1 + prop.louver_border),
+            verts=face.verts,
+            space=Matrix.Translation(-face.calc_center_median()),
+        )
+
+    usergroup = [FaceMap.WINDOW_LOUVERS, FaceMap.DOOR_LOUVERS][user == FillUser.DOOR]
+    extrude = map_new_faces(usergroup)(extrude_faces_add_slope)
+    extrude(bm, louver_faces, normal, prop.louver_depth)
+    add_faces_to_map(bm, validate(faces[::2]), usergroup)
+
+
+def subdivide_face_into_quads(bm, face, cuts_x, cuts_y):
+    """subdivide a face(quad) into more quads
+    """
+    v_edges = filter_vertical_edges(face.edges, face.normal)
+    h_edges = filter_horizontal_edges(face.edges, face.normal)
+
+    edges = []
+    if cuts_x > 0:
+        res = bmesh.ops.subdivide_edges(bm, edges=v_edges, cuts=cuts_x)
+        edges.extend(filter_geom(res["geom_inner"], BMEdge))
+
+    if cuts_y > 0:
+        res = bmesh.ops.subdivide_edges(bm, edges=h_edges + edges, cuts=cuts_y)
+        edges.extend(filter_geom(res["geom_inner"], BMEdge))
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.01)
+    return list({f for ed in validate(edges) for f in ed.link_faces})
+
+
+def duplicate_face_translate_scale(bm, face, position, scale, scale_center):
+    """Duplicate a face and transform it
+    """
+    ret = bmesh.ops.duplicate(bm, geom=[face])
+    verts = filter_geom(ret["geom"], BMVert)
+
+    bmesh.ops.scale(bm, verts=verts, vec=scale, space=Matrix.Translation(-scale_center))
+    bmesh.ops.translate(bm, verts=verts, vec=position)
+    return ret
+
+
+def extrude_edges_to_depth(bm, edges, depth):
+    """Extrude edges only and translate
+    """
+    ext = bmesh.ops.extrude_edge_only(bm, edges=edges)
+    bmesh.ops.translate(bm, verts=filter_geom(ext["geom"], BMVert), vec=depth)
+
+
+def extrude_faces_add_slope(bm, faces, extrude_normal, extrude_depth):
+    """Extrude faces and move top edge back to form a wedge
+    """
+    res = bmesh.ops.extrude_discrete_faces(bm, faces=faces)
+    bmesh.ops.translate(
+        bm,
+        vec=extrude_normal * extrude_depth,
+        verts=list({v for face in res["faces"] for v in face.verts}),
+    )
+
+    for face in res["faces"]:
+        top_edge = max(
+            filter_horizontal_edges(face.edges, face.normal),
+            key=lambda e: calc_edge_median(e).z,
+        )
+        bmesh.ops.translate(bm, vec=-face.normal * extrude_depth, verts=top_edge.verts)
+
+
+def subdivide_face_into_vertical_segments(bm, face, segments):
+    """Cut a face(quad) vertically into multiple faces
+    """
+    res = bmesh.ops.subdivide_edges(
+        bm, edges=filter_vertical_edges(face.edges, face.normal), cuts=segments
+    ).get("geom_inner")
+
+    return list({f for e in filter_geom(res, BMEdge) for f in e.link_faces})
+
+
+def double_and_make_even(value):
+    """multiply a number by 2 and make it even
+    """
+    double = value * 2
+    return double if double % 2 == 0 else double + 1
+
+
+def create_bar_from_face(bm, face, median, position, scale, depth, vertical=False):
+    """Create bar geometry from a face
+    """
+    dup = duplicate_face_translate_scale(bm, face, position, scale, median).get("geom")
+    edges = [filter_horizontal_edges, filter_vertical_edges][vertical](
+        filter_geom(dup, BMEdge), face.normal
+    )
+    extrude_edges_to_depth(bm, edges, depth)
+import math
+import bmesh
+from bmesh.types import BMFace, BMEdge, BMVert
+from mathutils import Vector, Matrix, Quaternion
+from ...utils import (
+    clamp,
+    FaceMap,
+    sort_edges,
+    edge_vector,
+    filter_geom,
+    map_new_faces,
+    subdivide_edges,
+    calc_edge_median,
+    filter_vertical_edges,
+    add_facemap_for_groups,
+)
+
+
+def create_railing(bm, faces, prop, normal):
+    vertical_edges = list({e for f in faces for e in filter_vertical_edges(f.edges, f.normal)})
+    add_facemap_for_groups(FaceMap.RAILING_POSTS)
+    make_corner_posts(bm, vertical_edges, prop, faces[0].normal)
+    for f in faces:
+        make_fill(bm, f, prop)
+    bmesh.ops.delete(bm, geom=faces, context="FACES")  # delete reference faces
+
+
+@map_new_faces(FaceMap.RAILING_POSTS)
+def make_corner_posts(bm, edges, prop, up):
+    for edge in edges:
+        ret = bmesh.ops.duplicate(bm, geom=[edge])
+        dup_edge = filter_geom(ret["geom"], BMEdge)[0]
+        edge_to_cylinder(bm, dup_edge, prop.corner_post_width/2, up, fill=True)
+
+
+def make_fill(bm, face, prop):
+    # duplicate original face and resize
+    ret = bmesh.ops.duplicate(bm, geom=[face])
+    dup_face = filter_geom(ret["geom"], BMFace)[0]
+    vertical = filter_vertical_edges(dup_face.edges, dup_face.normal)
+    non_vertical = [e for e in dup_face.edges if e not in vertical]
+    top_edge = sort_edges(non_vertical, Vector((0., 0., -1.)))[0]
+    bmesh.ops.translate(bm, verts=top_edge.verts, vec=Vector((0., 0., -1.))*prop.corner_post_width/2)
+
+    # create railing top
+    add_facemap_for_groups(FaceMap.RAILING_RAILS)
+    create_railing_top(bm, top_edge, prop)
+
+    # create fill
+    if prop.fill == "POSTS":
+        create_fill_posts(bm, dup_face, prop)
+    elif prop.fill == "RAILS":
+        create_fill_rails(bm, dup_face, prop)
+    elif prop.fill == "WALL":
+        add_facemap_for_groups(FaceMap.RAILING_WALLS)
+        create_fill_walls(bm, dup_face, prop)
+
+
+@map_new_faces(FaceMap.RAILING_RAILS)
+def create_railing_top(bm, top_edge, prop):
+    ret = bmesh.ops.duplicate(bm, geom=[top_edge])
+    top_dup_edge = filter_geom(ret["geom"], BMEdge)[0]
+    horizon = edge_vector(top_dup_edge).cross(Vector((0., 0., 1.)))
+    up = edge_vector(top_dup_edge)
+    up.rotate(Quaternion(horizon, math.pi/2).to_euler())
+
+    if not edge_vector(top_dup_edge).z:
+        scale_railing_edge(bm, top_dup_edge, prop.corner_post_width)
+
+    edge_to_cylinder(bm, top_dup_edge, prop.corner_post_width/2, up)
+    bmesh.ops.translate(bm, verts=top_edge.verts, vec=Vector((0., 0., -1.))*prop.corner_post_width/2)
+
+
+@map_new_faces(FaceMap.RAILING_POSTS)
+def create_fill_posts(bm, face, prop):
+    vertical_edges = filter_vertical_edges(face.edges, face.normal)
+    sorted_edges = sort_edges([e for e in face.edges if e not in vertical_edges], Vector((0., 0., -1.)))
+
+    # create posts
+    post_size = min(prop.post_fill.size, prop.corner_post_width)
+
+    top_edge = sorted_edges[0]
+    bottom_edge = sorted_edges[-1]
+    top_edge_vector = top_edge.verts[0].co - top_edge.verts[1].co
+    top_edge_vector.z = 0
+    n_posts = round(top_edge_vector.length*prop.post_fill.density/post_size)
+    dir = edge_vector(top_edge)
+    if n_posts != 0:
+        inner_edges = subdivide_edges(bm, [top_edge, bottom_edge], dir, widths=[1.]*(n_posts+1))
+        for edge in inner_edges:
+            ret = bmesh.ops.duplicate(bm, geom=[edge])
+            dup_edge = filter_geom(ret["geom"], BMEdge)[0]
+            up = face.normal
+            edge_to_cylinder(bm, dup_edge, post_size/2, up)
+        # delete reference faces
+        dup_faces = list({f for e in inner_edges for f in e.link_faces})
+        bmesh.ops.delete(bm, geom=dup_faces, context="FACES")
+    else:
+        # delete reference faces
+        bmesh.ops.delete(bm, geom=[face], context="FACES")
+
+
+@map_new_faces(FaceMap.RAILING_RAILS)
+def create_fill_rails(bm, face, prop):
+    # create rails
+    rail_size = min(prop.rail_fill.size, prop.corner_post_width)
+
+    vertical_edges = filter_vertical_edges(face.edges, face.normal)
+    n_rails = math.floor(vertical_edges[0].calc_length()*prop.rail_fill.density/rail_size)
+    if n_rails != 0:
+        inner_edges = subdivide_edges(bm, vertical_edges, Vector((0., 0., 1.)), widths=[1.]*(n_rails+1))
+        for edge in inner_edges:
+            ret = bmesh.ops.duplicate(bm, geom=[edge])
+            dup_edge = filter_geom(ret["geom"], BMEdge)[0]
+            up = face.normal
+            if not edge_vector(dup_edge).z:
+                scale_railing_edge(bm, dup_edge, prop.corner_post_width)
+            edge_to_cylinder(bm, dup_edge, rail_size/2, up)
+        # delete reference faces
+        dup_faces = list({f for e in inner_edges for f in e.link_faces})
+        bmesh.ops.delete(bm, geom=dup_faces, context="FACES")
+    else:
+        # delete reference faces
+        bmesh.ops.delete(bm, geom=[face], context="FACES")
+
+
+@map_new_faces(FaceMap.RAILING_WALLS)
+def create_fill_walls(bm, face, prop):
+    # create walls
+    wall_size = clamp(prop.wall_fill.width, 0.001, prop.corner_post_width)
+
+    ret = bmesh.ops.duplicate(bm, geom=[face])
+    dup_face = filter_geom(ret["geom"], BMFace)[0]
+    bmesh.ops.translate(bm, verts=dup_face.verts, vec=-face.normal*wall_size/2)
+    ret = bmesh.ops.extrude_edge_only(bm, edges=dup_face.edges)
+    verts = filter_geom(ret["geom"], BMVert)
+    bmesh.ops.translate(bm, verts=verts, vec=face.normal*wall_size)
+    bmesh.ops.contextual_create(bm, geom=verts)
+
+    # delete reference faces and hidden faces
+    bmesh.ops.delete(bm, geom=[face] + filter_geom(ret['geom'], BMFace), context="FACES")
+
+
+def edge_to_cylinder(bm, edge, radius, up, n=4, fill=False):
+    edge_vec = edge_vector(edge)
+    theta = (n-2)*math.pi/n
+    length = 2 * radius * math.tan(theta/2)
+
+    dir = up.copy()
+    dir.rotate(Quaternion(edge_vec, -math.pi+theta/2).to_euler())
+    bmesh.ops.translate(bm, verts=edge.verts, vec=dir*radius/math.sin(theta/2))
+    all_verts = [v for v in edge.verts]
+    dir.rotate(Quaternion(edge_vec, math.pi-theta/2).to_euler())
+    for i in range(0, n):
+        ret = bmesh.ops.extrude_edge_only(bm, edges=[edge])
+        edge = filter_geom(ret["geom"], BMEdge)[0]
+        bmesh.ops.translate(bm, verts=edge.verts, vec=dir*length)
+        dir.rotate(Quaternion(edge_vec, math.radians(360/n)).to_euler())
+        all_verts += edge.verts
+
+    bmesh.ops.remove_doubles(bm, verts=all_verts, dist=0.001)
+
+    if fill:  # fill holes
+        valid_verts = [v for v in all_verts if v.is_valid]
+        sorted_edges = sort_edges({e for v in valid_verts for e in v.link_edges}, edge_vec)
+        top_edges = sorted_edges[-n:]
+        bottom_edges = sorted_edges[:n]
+        bmesh.ops.holes_fill(bm, edges=top_edges)
+        bmesh.ops.holes_fill(bm, edges=bottom_edges)
+
+
+def scale_railing_edge(bm, edge, amount):
+    edge_len = edge.calc_length()
+    edge_scale = (edge_len - amount) / edge_len
+    bmesh.ops.scale(bm,
+                    verts=edge.verts,
+                    vec=Vector((1.,1.,1.))*edge_scale,
+                    space=Matrix.Translation(-calc_edge_median(edge)))
+import bpy
+
+from .railing_props import PostFillProperty, RailFillProperty, WallFillProperty, RailProperty
+
+classes = (
+    PostFillProperty,
+    RailFillProperty,
+    WallFillProperty,
+    RailProperty,
+)
+
+
+def register_railing():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_railing():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from bpy.props import (
+    FloatProperty, EnumProperty, BoolProperty, PointerProperty
+)
+
+
+def get_density(self):
+    return self.get("density", self.get("initial_density", 0.2))
+
+
+def set_density(self, value):
+    self["density"] = value
+
+
+class PostFillProperty(bpy.types.PropertyGroup):
+    size: FloatProperty(
+        name="Size",
+        min=0.01,
+        max=100.0,
+        default=0.05,
+        description="Size of each post",
+    )
+
+    density: FloatProperty(
+        name="Density",
+        min=0.0,
+        max=1.0,
+        get=get_density,
+        set=set_density,
+        description="Number of posts along each edge",
+    )
+
+    def init(self, initial_density):
+        self["initial_density"] = initial_density
+
+    def draw(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "density")
+        row.prop(self, "size")
+
+
+class RailFillProperty(bpy.types.PropertyGroup):
+    size: FloatProperty(
+        name="Rail Size",
+        min=0.01,
+        max=100.0,
+        default=0.05,
+        description="Size of each rail",
+    )
+
+    density: FloatProperty(
+        name="Rail Density",
+        min=0.0,
+        max=1.0,
+        default=0.3,
+        description="Number of rails over each edge",
+    )
+
+    def draw(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "density")
+        row.prop(self, "size")
+
+
+class WallFillProperty(bpy.types.PropertyGroup):
+    width: FloatProperty(
+        name="Wall Width",
+        min=0.0,
+        max=100.0,
+        default=0.075,
+        description="Width of each wall",
+    )
+
+    def draw(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "width")
+
+
+class RailProperty(bpy.types.PropertyGroup):
+
+    fill_types = [
+        ("POSTS", "Posts", "", 0),
+        ("RAILS", "Rails", "", 1),
+        ("WALL",  "Wall",  "", 2),
+    ]
+
+    fill: EnumProperty(
+        name="Fill Type",
+        items=fill_types,
+        default="POSTS",
+        description="Type of railing",
+    )
+
+    corner_post_width: FloatProperty(
+        name="Width",
+        min=0.01,
+        max=100.0,
+        default=0.1,
+        description="Width of each corner post",
+    )
+
+    corner_post_height: FloatProperty(
+        name="Height",
+        min=0.01,
+        max=100.0,
+        default=0.7,
+        description="Height of each corner post",
+    )
+
+    has_corner_post: BoolProperty(
+        name="Corner Posts",
+        default=True,
+        description="Whether the railing has corner posts",
+    )
+
+    offset: FloatProperty(
+        name="Offset",
+        default=0.05,
+        description="Railings offset",
+    )
+
+    post_fill: PointerProperty(type=PostFillProperty)
+    rail_fill: PointerProperty(type=RailFillProperty)
+    wall_fill: PointerProperty(type=WallFillProperty)
+
+    def init(self, stair_step_width=None, step_count=None):
+        if stair_step_width and self.fill == "POSTS":
+            if step_count > 1:
+                initial_density = (self.post_fill.size * (step_count-1))/(stair_step_width*step_count)
+            else:
+                initial_density = (self.post_fill.size - 0.001)/(2*stair_step_width)  # just enough to have 0 post on stairs
+            self.post_fill.init(initial_density=initial_density)
+
+    def draw(self, context, layout):
+
+        row = layout.row()
+        row.prop(self, "offset", text="Railing Offset")
+
+        row = layout.row()
+        row.prop_menu_enum(self, "fill", text=self.fill.title())
+
+        {
+            "POSTS" : self.post_fill,
+            "RAILS" : self.rail_fill,
+            "WALL"  : self.wall_fill
+        }.get(self.fill).draw(context, layout)
+
+        layout.label(text="Corner Posts")
+        row = layout.row(align=True)
+        row.prop(self, "corner_post_width")
+        row.prop(self, "corner_post_height")
+import bmesh
+from ..frame import add_frame_depth
+from ..window.window_types import fill_window_face
+
+from ..arch import (
+    fill_arch,
+    create_arch,
+    add_arch_depth,
+)
+from ..door.door_types import (
+    add_door_depth,
+    create_door_fill,
+)
+from ...utils import (
+    FaceMap,
+    local_xyz,
+    valid_ngon,
+    get_top_faces,
+    get_top_edges,
+    popup_message,
+    map_new_faces,
+    add_faces_to_map,
+    calc_face_dimensions,
+    subdivide_face_horizontally,
+    subdivide_face_vertically,
+)
+
+
+def create_multigroup(bm, faces, prop):
+    """ Create multigroup from face selection
+    """
+
+    for face in faces:
+        if not valid_ngon(face):
+            popup_message("Multigroup creation not supported for non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        face.select = False
+
+        array_faces = subdivide_face_horizontally(bm, face, widths=[prop.size_offset.size.x]*prop.count)
+        for aface in array_faces:
+            face = create_multigroup_split(bm, aface, prop.size_offset.size, prop.size_offset.offset)
+            doors, windows, arch = create_multigroup_frame(bm, face, prop)
+            for door in doors:
+                create_door_fill(bm, door, prop)
+            for window in windows:
+                fill_window_face(bm, window, prop)
+            if prop.add_arch:
+                fill_arch(bm, arch, prop)
+    return True
+
+
+@map_new_faces(FaceMap.WALLS)
+def create_multigroup_split(bm, face, size, offset):
+    """ Use properties from SizeOffset to subdivide face into regular quads
+    """
+
+    wall_w, wall_h = calc_face_dimensions(face)
+    # horizontal split
+    h_widths = [wall_w/2 + offset.x - size.x/2, size.x, wall_w/2 - offset.x - size.x/2]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical split
+    v_width = [wall_h/2 + offset.y + size.y/2, wall_h/2 - offset.y - size.y/2]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_width)
+
+    return v_faces[0]
+
+
+def create_multigroup_frame(bm, face, prop):
+    """ Extrude and inset face to make multigroup frame
+    """
+    normal = face.normal.copy()
+
+    dws = parse_components(prop.components)
+    door_faces, window_faces, frame_faces = make_multigroup_insets(bm, face, prop.size_offset.size, prop.frame_thickness, dws)
+    arch_face = None
+
+    # create arch
+    if prop.add_arch:
+        dw_count = count(dws)
+        top_edges = get_top_edges({e for f in get_top_faces(frame_faces, n=2*dw_count+1)[-dw_count-1:] for e in f.edges}, n=dw_count+1)
+        if dw_count == 1:
+            frame_faces.remove(get_top_faces(frame_faces).pop()) # remove top face from frame_faces
+        arch_face, arch_frame_faces = create_arch(bm, top_edges, frame_faces, prop.arch, prop.frame_thickness, local_xyz(face))
+        frame_faces += arch_frame_faces
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    # add depths
+    if prop.add_arch:
+        door_faces, window_faces, [arch_face], frame_faces = add_frame_depth(bm, door_faces, window_faces, [arch_face], frame_faces, prop.frame_depth, normal)
+        arch_face, new_frame_faces = add_arch_depth(bm, arch_face, prop.arch.depth, normal)
+        frame_faces += new_frame_faces
+    else:
+        door_faces, window_faces, _, frame_faces = add_frame_depth(bm, door_faces, window_faces, [], frame_faces, prop.frame_depth, normal)
+
+    door_faces, new_frame_faces = add_multi_door_depth(bm, door_faces, prop.dw_depth, normal)
+    frame_faces += new_frame_faces
+    window_faces, new_frame_faces = add_multi_window_depth(bm, window_faces, prop.dw_depth, normal)
+    frame_faces += new_frame_faces
+
+    # add face maps
+    add_faces_to_map(bm, door_faces, FaceMap.DOOR)
+    add_faces_to_map(bm, window_faces, FaceMap.WINDOW)
+    add_faces_to_map(bm, frame_faces, FaceMap.FRAME)
+    if prop.add_arch:
+        add_faces_to_map(bm, [arch_face], FaceMap.DOOR)
+
+    return door_faces, window_faces, arch_face
+
+
+def add_multi_door_depth(bm, door_faces, depth, normal):
+    new_door_faces = []
+    new_frame_faces = []
+    for door in door_faces:
+        df, ff = add_door_depth(bm, door, depth, normal)
+        new_door_faces.append(df)
+        new_frame_faces += ff
+    return new_door_faces, new_frame_faces
+
+
+def add_multi_window_depth(bm, window_faces, depth, normal):
+    new_window_faces = []
+    new_frame_faces = []
+    for window in window_faces:
+        wf, ff = add_door_depth(bm, window, depth, normal)
+        new_window_faces.append(wf)
+        new_frame_faces += ff
+    return new_window_faces, new_frame_faces
+
+
+def make_multigroup_insets(bm, face, size, frame_thickness, dws):
+    dw_count = count(dws)
+    dw_width = (size.x - frame_thickness * (dw_count + 1)) / dw_count
+    door_height = calc_face_dimensions(face)[1] - frame_thickness
+    window_height = size.y - 2 * frame_thickness
+
+    # adjacent doors/windows clubbed
+    clubbed_widths = [clubbed_width(dw_width, frame_thickness, dw['type'], dw['count'], i == 0, i == len(dws)-1) for i, dw in enumerate(dws)]
+    clubbed_faces = subdivide_face_horizontally(bm, face, clubbed_widths)
+
+    doors = []
+    windows = []
+    frames = []
+
+    for i, (dw, f) in enumerate(zip(dws, clubbed_faces)):
+        if dw['type'] == 'door':
+            ds, fs = make_door_insets(bm, f, dw['count'], door_height, dw_width, frame_thickness, i == 0, i == len(dws)-1)
+            doors.extend(ds)
+            frames.extend(fs)
+        elif dw['type'] == 'window':
+            ws, fs = make_window_insets(bm, f, dw['count'], window_height, dw_width, frame_thickness, i == 0, i == len(dws)-1)
+            windows.extend(ws)
+            frames.extend(fs)
+    return doors, windows, frames
+
+
+def clubbed_width(width, frame_thickness, type, count, first=False, last=False):
+    if type == "door":
+        return (width * count) + (frame_thickness * (count+1))
+    elif type == "window":
+        if first and last:
+            return (width * count) + (frame_thickness * (count+1))
+        elif first or last:
+            return (width * count) + (frame_thickness * count)
+        else:
+            return (width * count) + (frame_thickness * (count-1))
+
+
+def make_window_insets(bm, face, count, window_height, window_width, frame_thickness, first=False, last=False):
+    # split vertically for window
+    face_height = calc_face_dimensions(face)[1]
+    res = subdivide_face_vertically(bm, face, [face_height - (window_height+2*frame_thickness), window_height+2*frame_thickness])
+    if not res:
+        return [], []
+
+    face = res[1]
+    # vertical frame
+    if first and last:
+        h_widths = [frame_thickness, window_width] * count + [frame_thickness]
+    elif first:
+        h_widths = [frame_thickness, window_width] * count
+    elif last:
+        h_widths = [window_width, frame_thickness] * count
+    else:
+        h_widths = [window_width, frame_thickness] * (count-1) + [window_width]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # horizontal frames
+    if first:
+        work_faces = h_faces[1::2]
+        v_frames = h_faces[::2]
+    else:
+        work_faces = h_faces[::2]
+        v_frames = h_faces[1::2]
+    v_widths = [frame_thickness, window_height, frame_thickness]
+    v_faces = [f for h_face in work_faces for f in subdivide_face_vertically(bm, h_face, v_widths)]
+
+    return v_faces[1::3], v_frames + v_faces[::3] + v_faces[2::3]
+
+
+def make_door_insets(bm, face, count, door_height, door_width, frame_thickness, first=False, last=False):
+    # vertical frame
+    h_widths = [frame_thickness, door_width] * count + [frame_thickness]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # horizontal frames
+    v_widths = [door_height, frame_thickness]
+    v_faces = [f for h_face in h_faces[1::2] for f in subdivide_face_vertically(bm, h_face, v_widths)]
+    return v_faces[::2], h_faces[::2] + v_faces[1::2]
+
+
+def count(dws):
+    return sum(dw["count"] for dw in dws)
+
+
+def parse_components(components):
+    char_to_type = {
+        "d": "door",
+        "w": "window",
+    }
+    previous = None
+    dws = []
+    for c in components:
+        if c == previous:
+            dws[-1]["count"] += 1
+        else:
+            dws.append({"type": char_to_type.get(c), "count": 1})
+            previous = c
+    return dws
+import bpy
+from bpy.props import FloatProperty, EnumProperty, PointerProperty, BoolProperty, StringProperty
+
+from ..fill import FillPanel, FillLouver, FillGlassPanes
+from ..generic import ArchProperty, SizeOffsetProperty, CountProperty
+
+
+class MultigroupProperty(bpy.types.PropertyGroup):
+    frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Thickness of door/window Frame",
+    )
+
+    frame_depth: FloatProperty(
+        name="Frame Depth",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        step=1,
+        description="Depth of door/window Frame",
+    )
+
+    dw_depth: FloatProperty(
+        name="Door/Window Depth",
+        min=0.0,
+        max=1.0,
+        default=0.05,
+        description="Depth of door/window",
+    )
+
+    add_arch: BoolProperty(
+        name="Add Arch",
+        default=False,
+        description="Add arch over door/window",
+    )
+
+    components: StringProperty(
+        name="Components",
+        default="dw",
+        description="Components (Door and Windows): example: 'wdw' for a door surrounded by windows",
+    )
+
+    fill_items = [
+        ("NONE", "None", "", 0),
+        ("PANELS", "Panels", "", 1),
+        ("GLASS_PANES", "Glass_Panes", "", 2),
+        ("LOUVER", "Louver", "", 3),
+    ]
+
+    fill_type: EnumProperty(
+        name="Fill Type",
+        items=fill_items,
+        default="NONE",
+        description="Type of fill for door/window",
+    )
+
+    count: CountProperty
+    arch: PointerProperty(type=ArchProperty)
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    double_door: BoolProperty(
+        name="Double Door",
+        default=False,
+        description="Double door",
+    )
+
+    panel_fill: PointerProperty(type=FillPanel)
+    glass_fill: PointerProperty(type=FillGlassPanes)
+    louver_fill: PointerProperty(type=FillLouver)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0]/self.count, self['wall_dimensions'][1]), default_size=(2.0, 1.0), default_offset=(0.0, 0.0))
+        self.arch.init(wall_dimensions[1]/2 - self.size_offset.offset.y - self.size_offset.size.y/2)
+
+    def draw(self, context, layout):
+        box = layout.box()
+        self.size_offset.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="Components")
+        col.prop(self, "components", text="")
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "dw_depth")
+        row = col.row(align=True)
+        row.prop(self, "frame_depth")
+        row.prop(self, "frame_thickness")
+
+        col = box.column(align=True)
+        col.prop(self, "count")
+
+        col = box.column(align=True)
+        col.prop(self, "double_door")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "add_arch")
+        if self.add_arch:
+            self.arch.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop_menu_enum(self, "fill_type")
+
+        # -- draw fill types
+        fill_map = {
+            "PANELS": self.panel_fill,
+            "LOUVER": self.louver_fill,
+            "GLASS_PANES": self.glass_fill,
+        }
+        fill = fill_map.get(self.fill_type)
+        if fill:
+            fill.draw(box)
+import bpy
+from .multigroup import Multigroup
+from .multigroup_props import MultigroupProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_multigroup(bpy.types.Operator):
+    """Create multiple door/window group from selected faces"""
+
+    bl_idname = "btools.add_multigroup"
+    bl_label = "Add Multigroup"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=MultigroupProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Multigroup.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+
+from .multigroup_ops import BTOOLS_OT_add_multigroup
+from .multigroup_props import MultigroupProperty
+
+classes = (MultigroupProperty, BTOOLS_OT_add_multigroup)
+
+
+def register_multigroup():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_multigroup():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+
+from .multigroup_types import create_multigroup
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Multigroup:
+    @classmethod
+    def build(cls, context, props):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_multigroup_facemaps()
+            if create_multigroup(bm, faces, props):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_multigroup_facemaps(cls):
+        groups = FaceMap.DOOR, FaceMap.WINDOW, FaceMap.FRAME
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bmesh
+
+from .balcony_types import create_balcony
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Balcony:
+    @classmethod
+    def build(cls, context, prop):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_balcony_facemaps()
+            create_balcony(bm, faces, prop)
+            bmesh.update_edit_mesh(me, True)
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_balcony_facemaps(cls):
+        groups = FaceMap.BALCONY
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            # -- ensure none are upward facing
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+
+from .balcony_ops import BTOOLS_OT_add_balcony
+from .balcony_props import BalconyProperty
+
+classes = (BalconyProperty, BTOOLS_OT_add_balcony)
+
+
+def register_balcony():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_balcony():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bpy
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
+
+from ..railing.railing_props import RailProperty
+from ..generic import SizeOffsetProperty
+
+
+class BalconyProperty(bpy.types.PropertyGroup):
+    redo: BoolProperty()
+
+    slab_height: FloatProperty(
+        name="Slab Height",
+        min=0.01,
+        max=100.0,
+        default=0.2,
+        description="Height of balcony slab",
+    )
+
+    depth_offset: FloatProperty(
+        name="Depth Offset",
+        min=0.0,
+        max=100.0,
+        default=0.0,
+        description="Depth offset of balcony",
+    )
+
+    has_railing: BoolProperty(
+        name="Add Railing", default=True, description="Whether the balcony has railing"
+    )
+
+    rail: PointerProperty(type=RailProperty)
+
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0], self['wall_dimensions'][1]), default_size=(1.6, 1.0), default_offset=(0.0, 0.0), restricted=False)
+
+    def draw(self, context, layout):
+        self.size_offset.draw(context, layout)
+
+        col = layout.column(align=True)
+        col.prop(self, "depth_offset")
+
+        col = layout.column(align=True)
+        col.prop(self, "slab_height")
+
+        layout.prop(self, "has_railing")
+        if self.has_railing:
+            box = layout.box()
+            self.rail.draw(context, box)
+import bpy
+from .balcony import Balcony
+from .balcony_props import BalconyProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_balcony(bpy.types.Operator):
+    """Create a balcony from selected faces"""
+
+    bl_idname = "btools.add_balcony"
+    bl_label = "Add Balcony"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=BalconyProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Balcony.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bmesh
+from bmesh.types import BMVert, BMFace
+from mathutils import Vector
+
+from ...utils import (
+    FaceMap,
+    filter_geom,
+    add_faces_to_map,
+    get_top_faces,
+    sort_edges,
+    local_xyz,
+    create_face,
+    valid_ngon,
+    popup_message,
+)
+
+from ..railing.railing import create_railing
+
+
+def create_balcony(bm, faces, prop):
+    """Generate balcony geometry
+    """
+    for f in faces:
+        if not valid_ngon(f):
+            popup_message("Balcony creation not supported for non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        f.select = False
+
+        normal = f.normal.copy()
+        f = create_balcony_split(bm, f, prop)
+        add_faces_to_map(bm, [f], FaceMap.BALCONY)
+
+        front, top = extrude_balcony(bm, f, prop.size_offset.size.y, normal)
+
+        if prop.has_railing:
+            add_railing_to_balcony(bm, top, normal, prop)
+        bmesh.ops.delete(bm, geom=[f], context="FACES_ONLY")
+
+
+def extrude_balcony(bm, face, depth, normal):
+    front = filter_geom(bmesh.ops.extrude_face_region(bm, geom=[face])["geom"], BMFace)[0]
+    map_balcony_faces(bm, front)
+    bmesh.ops.translate(
+        bm, verts=front.verts, vec=normal * depth
+    )
+
+    top = get_top_faces(f for e in front.edges for f in e.link_faces)[0]
+    return front, top
+
+
+def add_railing_to_balcony(bm, top, balcony_normal, prop):
+    """Add railing to the balcony
+    """
+    ret = bmesh.ops.duplicate(bm, geom=[top])
+    dup_top = filter_geom(ret["geom"], BMFace)[0]
+
+    ret = bmesh.ops.inset_individual(
+        bm, faces=[dup_top], thickness=prop.rail.offset, use_even_offset=True
+    )
+    bmesh.ops.delete(bm, geom=ret["faces"], context="FACES")
+
+    edges = sort_edges(dup_top.edges, balcony_normal)[1:]
+    railing_geom = bmesh.ops.extrude_edge_only(bm, edges=edges)["geom"]
+    bmesh.ops.translate(
+        bm, verts=filter_geom(railing_geom, BMVert), vec=(0., 0., prop.rail.corner_post_height)
+    )
+
+    bmesh.ops.delete(bm, geom=[dup_top], context="FACES")
+
+    railing_faces = filter_geom(railing_geom, BMFace)
+    create_railing(bm, railing_faces, prop.rail, balcony_normal)
+
+
+def map_balcony_faces(bm, face):
+    """ Add balcony faces to their facemap """
+    new_faces = {
+        f
+        for e in face.edges
+        for f in e.link_faces
+    }
+    add_faces_to_map(bm, new_faces, FaceMap.BALCONY)
+
+
+def create_balcony_split(bm, face, prop):
+    """Use properties to create face
+    """
+    xyz = local_xyz(face)
+    size = Vector((prop.size_offset.size.x, prop.slab_height))
+    f = create_face(bm, size, prop.size_offset.offset, xyz)
+    bmesh.ops.translate(
+        bm, verts=f.verts, vec=face.calc_center_bounds() - face.normal*prop.depth_offset
+    )
+    return f
+import bmesh
+
+from .door_types import create_door
+from ...utils import get_edit_mesh, FaceMap, add_facemap_for_groups, verify_facemaps_for_object
+
+
+class Door:
+    @classmethod
+    def build(cls, context, props):
+        verify_facemaps_for_object(context.object)
+        me = get_edit_mesh()
+        bm = bmesh.from_edit_mesh(me)
+        faces = [face for face in bm.faces if face.select]
+
+        if cls.validate(faces):
+            cls.add_door_facemaps()
+            if create_door(bm, faces, props):
+                bmesh.update_edit_mesh(me, True)
+                return {"FINISHED"}
+        return {"CANCELLED"}
+
+    @classmethod
+    def add_door_facemaps(cls):
+        groups = FaceMap.DOOR, FaceMap.FRAME
+        add_facemap_for_groups(groups)
+
+    @classmethod
+    def validate(cls, faces):
+        if faces:
+            if not any([round(f.normal.z, 1) for f in faces]):
+                return True
+        return False
+import bpy
+from bpy.props import FloatProperty, EnumProperty, PointerProperty, BoolProperty
+
+from ..fill import FillPanel, FillLouver, FillGlassPanes
+from ..generic import ArchProperty, SizeOffsetProperty, CountProperty
+
+
+class DoorProperty(bpy.types.PropertyGroup):
+    frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        min=0.01,
+        max=1.0,
+        default=0.1,
+        description="Thickness of door Frame",
+    )
+
+    frame_depth: FloatProperty(
+        name="Frame Depth",
+        min=-1.0,
+        max=1.0,
+        default=0.0,
+        step=1,
+        description="Depth of door Frame",
+    )
+
+    door_depth: FloatProperty(
+        name="Door Depth",
+        min=0.0,
+        max=1.0,
+        default=0.05,
+        description="Depth of door",
+    )
+
+    add_arch: BoolProperty(
+        name="Add Arch",
+        default=False,
+        description="Add arch over door/window",
+    )
+
+    fill_items = [
+        ("NONE", "None", "", 0),
+        ("PANELS", "Panels", "", 1),
+        ("GLASS_PANES", "Glass_Panes", "", 2),
+        ("LOUVER", "Louver", "", 3),
+    ]
+
+    fill_type: EnumProperty(
+        name="Fill Type",
+        items=fill_items,
+        default="NONE",
+        description="Type of fill for door",
+    )
+
+    count: CountProperty
+    arch: PointerProperty(type=ArchProperty)
+    size_offset: PointerProperty(type=SizeOffsetProperty)
+
+    double_door: BoolProperty(
+        name="Double Door",
+        default=False,
+        description="Double door",
+    )
+
+    panel_fill: PointerProperty(type=FillPanel)
+    glass_fill: PointerProperty(type=FillGlassPanes)
+    louver_fill: PointerProperty(type=FillLouver)
+
+    def init(self, wall_dimensions):
+        self['wall_dimensions'] = wall_dimensions
+        self.size_offset.init((self['wall_dimensions'][0]/self.count, self['wall_dimensions'][1]), default_size=(1.0, 1.0), default_offset=(0.0, 0.0))
+        self.arch.init(wall_dimensions[1]/2 - self.size_offset.offset.y - self.size_offset.size.y/2)
+
+    def draw(self, context, layout):
+        box = layout.box()
+        self.size_offset.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "frame_depth")
+        row.prop(self, "frame_thickness")
+        row = col.row(align=True)
+        row.prop(self, "door_depth")
+
+        col = box.column(align=True)
+        col.prop(self, "count")
+
+        col = box.column(align=True)
+        col.prop(self, "double_door")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "add_arch")
+        if self.add_arch:
+            self.arch.draw(context, box)
+
+        box = layout.box()
+        col = box.column(align=True)
+        prop_name = "Fill Type" if self.fill_type == "NONE" else self.fill_type.title().replace('_', ' ')
+        col.prop_menu_enum(self, "fill_type", text=prop_name)
+
+        # -- draw fill types
+        fill_map = {
+            "PANELS": self.panel_fill,
+            "LOUVER": self.louver_fill,
+            "GLASS_PANES": self.glass_fill,
+        }
+        fill = fill_map.get(self.fill_type)
+        if fill:
+            fill.draw(box)
+import bpy
+from .door import Door
+from .door_props import DoorProperty
+from ...utils import get_selected_face_dimensions
+
+
+class BTOOLS_OT_add_door(bpy.types.Operator):
+    """Create a door from selected faces"""
+
+    bl_idname = "btools.add_door"
+    bl_label = "Add Door"
+    bl_options = {"REGISTER", "UNDO"}
+
+    props: bpy.props.PointerProperty(type=DoorProperty)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        self.props.init(get_selected_face_dimensions(context))
+        return Door.build(context, self.props)
+
+    def draw(self, context):
+        self.props.draw(context, self.layout)
+import bpy
+
+from .door_ops import BTOOLS_OT_add_door
+from .door_props import DoorProperty
+
+classes = (DoorProperty, BTOOLS_OT_add_door)
+
+
+def register_door():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister_door():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
+import bmesh
+from ..generic import clamp_count
+from ..frame import add_frame_depth
+from ..fill import fill_panel, fill_glass_panes, fill_louver, FillUser
+
+from ..arch import (
+    fill_arch,
+    create_arch,
+    add_arch_depth,
+)
+from ...utils import (
+    FaceMap,
+    local_xyz,
+    valid_ngon,
+    popup_message,
+    map_new_faces,
+    get_top_edges,
+    get_top_faces,
+    get_bottom_faces,
+    add_faces_to_map,
+    extrude_face_region,
+    calc_face_dimensions,
+    add_facemap_for_groups,
+    subdivide_face_vertically,
+    subdivide_face_horizontally,
+)
+
+
+def create_door(bm, faces, prop):
+    """Create door from face selection
+    """
+    for face in faces:
+        if not valid_ngon(face):
+            popup_message("Door creation not supported non-rectangular n-gon!", "Ngon Error")
+            return False
+
+        face.select = False
+        clamp_count(calc_face_dimensions(face)[0], prop.frame_thickness * 2, prop)
+        array_faces = subdivide_face_horizontally(bm, face, widths=[prop.size_offset.size.x]*prop.count)
+        for aface in array_faces:
+            face = create_door_split(bm, aface, prop.size_offset.size, prop.size_offset.offset)
+            door, arch = create_door_frame(bm, face, prop)
+            create_door_fill(bm, door, prop)
+            if prop.add_arch:
+                fill_arch(bm, arch, prop)
+    return True
+
+
+@map_new_faces(FaceMap.WALLS)
+def create_door_split(bm, face, size, offset):
+    """Use properties from SizeOffset to subdivide face into regular quads
+    """
+
+    wall_w, wall_h = calc_face_dimensions(face)
+    # horizontal split
+    h_widths = [wall_w/2 + offset.x - size.x/2, size.x, wall_w/2 - offset.x - size.x/2]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical split
+    v_width = [wall_h/2 + offset.y + size.y/2, wall_h/2 - offset.y - size.y/2]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_width)
+
+    return v_faces[0]
+
+
+def create_door_frame(bm, face, prop):
+    """Extrude and inset face to make door frame
+    """
+    normal = face.normal.copy()
+
+    door_face, frame_faces = make_door_inset(bm, face, prop.size_offset.size, prop.frame_thickness)
+    arch_face = None
+
+    # create arch
+    if prop.add_arch:
+        frame_faces.remove(get_top_faces(frame_faces).pop()) # remove top face from frame_faces
+        top_edges = get_top_edges({e for f in get_bottom_faces(frame_faces, n=2) for e in f.edges}, n=2)
+        arch_face, arch_frame_faces = create_arch(bm, top_edges, frame_faces, prop.arch, prop.frame_thickness, local_xyz(face))
+        frame_faces += arch_frame_faces
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    # add depths
+    if prop.add_arch:
+        [door_face], _, [arch_face], frame_faces = add_frame_depth(bm, [door_face], [], [arch_face], frame_faces, prop.frame_depth, normal)
+        arch_face, new_frame_faces = add_arch_depth(bm, arch_face, prop.arch.depth, normal)
+        frame_faces += new_frame_faces
+    else:
+        [door_face], _, _, frame_faces = add_frame_depth(bm, [door_face], [], [], frame_faces, prop.frame_depth, normal)
+
+    door_face, new_frame_faces = add_door_depth(bm, door_face, prop.door_depth, normal)
+    frame_faces += new_frame_faces
+
+    # add face maps
+    add_faces_to_map(bm, [door_face], FaceMap.DOOR)
+    add_faces_to_map(bm, frame_faces, FaceMap.FRAME)
+    if prop.add_arch:
+        add_faces_to_map(bm, [arch_face], FaceMap.DOOR)
+
+    return door_face, arch_face
+
+
+def add_door_depth(bm, door, depth, normal):
+    if depth > 0.0:
+        door_faces, frame_faces = extrude_face_region(bm, [door], -depth, normal)
+        return door_faces[0], frame_faces
+    else:
+        return door, []
+
+
+def create_door_fill(bm, face, prop):
+    """Add decorative elements on door face
+    """
+    if prop.double_door:
+        faces = subdivide_face_horizontally(bm, face, widths=[1, 1])
+        for f in faces:
+            fill_door_face(bm, f, prop)
+    else:
+        fill_door_face(bm, face, prop)
+
+
+def fill_door_face(bm, face, prop):
+    """ Fill individual door face
+    """
+    if prop.fill_type == "PANELS":
+        add_facemap_for_groups(FaceMap.DOOR_PANELS)
+        fill_panel(bm, face, prop.panel_fill)
+    elif prop.fill_type == "GLASS_PANES":
+        add_facemap_for_groups(FaceMap.DOOR_PANES)
+        fill_glass_panes(bm, face, prop.glass_fill, user=FillUser.DOOR)
+    elif prop.fill_type == "LOUVER":
+        add_facemap_for_groups(FaceMap.DOOR_LOUVERS)
+        fill_louver(bm, face, prop.louver_fill, user=FillUser.DOOR)
+
+
+def make_door_inset(bm, face, size, frame_thickness):
+    """ Make one horizontal cut and two vertical cuts on face
+    """
+    door_width = size.x - frame_thickness * 2
+    _, face_height = calc_face_dimensions(face)
+    door_height = face_height - frame_thickness
+    # horizontal cuts
+    h_widths = [frame_thickness, door_width, frame_thickness]
+    h_faces = subdivide_face_horizontally(bm, face, h_widths)
+    # vertical cuts
+    v_widths = [door_height, frame_thickness]
+    v_faces = subdivide_face_vertically(bm, h_faces[1], v_widths)
+    return v_faces[0], h_faces[::2] + [v_faces[1]]

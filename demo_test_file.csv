@@ -1,0 +1,7 @@
+0
+"            if add_all:
+"
+"            load_library.load_op_library(lib_file)
+"
+"    assert data.val_neg_edge_index.size() == (2, 2)
+"

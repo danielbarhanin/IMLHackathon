@@ -3,6 +3,9 @@ import numpy as np
 
 
 class GitHubClassifier:
+    """
+    a classifier that distinguishes between given GitHub coding projects
+    """
 
     def __init__(self):
         self.words = open("words.txt", 'r', encoding='utf-8').read().splitlines()
@@ -58,12 +61,3 @@ class GitHubClassifier:
         6 - pytorch_geometric
         """
         return self.model.predict(self.samples_to_vec(X))
-
-
-obj = GitHubClassifier()
-
-s = "else:\nraise OSError('Jina requires Python 3.7 and above, but yours is %s' % sys.version)"
-g="if sys.version_info >= (3, 8, 0):\npy_tag = PY38"
-e="except FileNotFoundError:\n__version__ = '0.0.0'"
-s1 = obj.samples_to_vec([s,g,e])
-print(s1)

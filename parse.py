@@ -1,11 +1,13 @@
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
 import joblib
 from sklearn.model_selection import train_test_split
 
 
-class ParseProjects():
+class ParseProjects:
+    """
+    parses the coding files projects, extracting features and creating a RandomForest classifier.
+    """
 
     def __init__(self):
         self.delimiters = ['.', ',', '(', ')', '[', ']', '{', '}', '=', ':',
@@ -13,7 +15,6 @@ class ParseProjects():
                            '`', '-', '\\', '/', '+', ';', '|', '&', '@', '<', '>', '^', '!']
 
         self.projects = ["building_tool", "espnet", "horovod", "jina", "PaddleHub", "PySolFC", "pytorch_geometric"]
-
 
     def split_sample(self, sample):
         """
@@ -26,17 +27,15 @@ class ParseProjects():
             new_sample = new_sample.replace(delimiter, " ")
         return new_sample.split()
 
-
     def parse_files(self):
         """
         parses the files of the dataset for the training - a code file for each one of the 7 projects.
-        :param files: A list of files containing the code files.
         :return: X - the train data containing strings (represents few lines of code) , y - the labeled vector.
         """
         X = []
         y = []
         for i in range(len(self.projects)):
-            with open(self.projects[i] + '_all_data.txt', 'r', encoding='utf-8') as f:
+            with open("Projects_data\\" + self.projects[i] + '_all_data.txt', 'r', encoding='utf-8') as f:
                 while True:
                     num_lines = np.random.randint(1, 6)
                     sample = ""
@@ -49,13 +48,13 @@ class ParseProjects():
                     y.append(i)
         return X, y
 
-
-    def sub_sets_words(self, all_words):
-        all_words = list(all_words)
-        return all_words
-
-
-    def build_words_features(self, X, y, n):
+    def build_words_features(self, X, y):
+        """
+        extracts words features from the given parsed code files of the projects.
+        :param X: the parsed code files.
+        :param y: the labeled vector
+        :return:
+        """
         all_words = set()
         sets = np.array([set(), set(), set(), set(), set(), set(), set()])
         dicts = np.array([{}, {}, {}, {}, {}, {}, {}])
@@ -71,10 +70,9 @@ class ParseProjects():
             a = sorted(dicts[j].keys(), key=dicts[j].get, reverse=True)
             sets[j] = set(a[:150])
             all_words = all_words | sets[j]
-        return self.sub_sets_words(all_words)
+        return list(all_words)
 
-
-    def samples_to_vec(self,samples, words):
+    def samples_to_vec(self, samples, words):
         """
         converts a samples represented by string (few lines of code) into
         a matrix X of floats
@@ -96,25 +94,18 @@ class ParseProjects():
         return X
 
     def train_model(self):
-        X_str, y = self.parse_files()
-        x_str_train, x_str_test, y_train, y_test = train_test_split(X_str, y, test_size=0.2)
+        """
+        trained a RandomForestClassifier on the given code files of the projects and print the score
+        on the test set.
+        """
+        X, y = self.parse_files()
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
-        good_words = self.build_words_features(x_str_train, y_train, 7)
-        print("####")
-        x_train, x_test = self.samples_to_vec(x_str_train, good_words), self.samples_to_vec(x_str_test, good_words)
-        print("########")
-        forest = RandomForestClassifier(max_depth=60, n_estimators=47).fit(x_train, y_train)
-        print("##########")
+        words_features = self.build_words_features(X_train, y_train)
+        X_train, x_test = self.samples_to_vec(X_train, words_features), self.samples_to_vec(X_test, words_features)
+        trained_model = RandomForestClassifier(max_depth=60, n_estimators=47).fit(X_train, y_train)
+        joblib.dump(trained_model, "trained_model.sav")
 
-        print(forest.score(x_test, y_test))
-
-        model2 = joblib.load("trained_model.sav")
-        print(model2.score(x_train, y_train))
-
-
-
-# def k_fold_validation_l(x, y, k, model, parameter):
-#     return GridSearchCV(model(), parameter, cv=k).fit(x, y)
-
-
+        # test model
+        print(trained_model.score(x_test, y_test))
 

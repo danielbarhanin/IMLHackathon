@@ -103,7 +103,7 @@ class ParseProjects:
 
         words_features = self.build_words_features(X_train, y_train)
         X_train, x_test = self.samples_to_vec(X_train, words_features), self.samples_to_vec(X_test, words_features)
-        trained_model = RandomForestClassifier(max_depth=60, n_estimators=47).fit(X_train, y_train)
+        trained_model = RandomForestClassifier(max_depth=102, n_estimators=120).fit(X_train, y_train)
         joblib.dump(trained_model, "trained_model.sav")
 
         # test model
